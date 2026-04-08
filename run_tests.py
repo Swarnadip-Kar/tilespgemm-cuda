@@ -31,7 +31,25 @@ import urllib.error
 import time
 import re
 import argparse
-import scipy.sparse as sp
+
+
+def _ensure_deps():
+    """Install missing Python dependencies before they are imported."""
+    import importlib.util
+    needed = {"numpy": "numpy"}   # map: import-name -> pip-name
+    # scipy.sparse was imported previously but is not actually used;
+    # keep it here commented out so it is easy to add back if needed.
+    # needed["scipy"] = "scipy"
+    missing = [pip for mod, pip in needed.items()
+               if importlib.util.find_spec(mod) is None]
+    if missing:
+        print(f"Installing missing dependencies: {', '.join(missing)}")
+        subprocess.check_call(
+            [sys.executable, "-m", "pip", "install", "--quiet"] + missing
+        )
+
+_ensure_deps()
+
 import numpy as np
 
 
