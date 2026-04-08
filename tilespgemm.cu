@@ -784,8 +784,7 @@ __global__ void numeric_phase_kernel(
                 while (row_mask) {
                     int c = __ffs(row_mask) - 1;  /* index of lowest set bit */
                     col_list[col_count] = (unsigned char)(r * TILE_WIDTH + c);
-                    colIdx_C_out[write] = tile_i * TILE_WIDTH * B->tilen +
-                                         r * TILE_WIDTH + c;  /* placeholder; set globally */
+                    colIdx_C_out[write] = tile_j * TILE_WIDTH + c;
                     val_C_out[write] = dense_acc[r * TILE_WIDTH + c];
                     write++; col_count++;
                     row_mask &= row_mask - 1;  /* clear lowest set bit */
