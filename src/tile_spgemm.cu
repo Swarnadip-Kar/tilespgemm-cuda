@@ -696,12 +696,16 @@ int main(int argc, char **argv)
     CUDA_CHECK(cudaMalloc(&d_colIdxC, nnzC_safe * sizeof(unsigned char)));
     CUDA_CHECK(cudaMalloc(&d_valC,    nnzC_safe * sizeof(double)));
 
-    /* ── STEP 3 ── */
+   /* ── STEP 3 ── */
     fprintf(stderr, "[TileSpGEMM] Step 3: GPU numeric (256 threads/tile) ...\n");
+    double t_step3_ms = 0.0;
     {
         int blocks = (numTilesC > 0) ? numTilesC : 1;
+        
+        /* Sync before wall-clock start to ensure GPU is completely idle */
         CUDA_CHECK(cudaDeviceSynchronize());
-        CUDA_CHECK(cudaEventRecord(ev0));
+        double t_step3_wall_start = wtime();
+
         step3_numeric_kernel<<<blocks, TILE_SIZE>>>(
             TA.d_tilePtr, TA.d_tileColIdx, TA.d_tileNnzPrefix,
             TA.d_rowPtr,  TA.d_colIdx, TA.d_val,
@@ -709,12 +713,13 @@ int main(int argc, char **argv)
             TB.d_rowPtr,  TB.d_colIdx, TB.d_val, TB.d_mask,
             d_tileColIdxC, d_tileNnzPrefixC, d_rowPtrC, d_maskC, d_tile_row,
             d_rowIdxC, d_colIdxC, d_valC, numTilesC);
-        CUDA_CHECK(cudaEventRecord(ev1));
-        CUDA_CHECK(cudaEventSynchronize(ev1));
+            
+        /* Sync to block CPU until the Step 3 kernel is entirely finished */
+        CUDA_CHECK(cudaDeviceSynchronize());
         CUDA_CHECK(cudaGetLastError());
+        
+        t_step3_ms = (wtime() - t_step3_wall_start) * 1e3;
     }
-    float f3; CUDA_CHECK(cudaEventElapsedTime(&f3, ev0, ev1));
-    double t_step3_ms = (double)f3;
     fprintf(stderr, "[TileSpGEMM] Step 3 done: nnzC=%d, %.2f ms\n", nnzC_total, t_step3_ms);
 
    /* ── Stats & End-to-End Timing ── */
