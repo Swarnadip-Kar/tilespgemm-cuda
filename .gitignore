@@ -1,0 +1,44 @@
+# Python virtual environment
+.venv/
+venv/
+env/
+ENV/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# Compiled CUDA/C++ binaries
+build/
+
+# Benchmark results and generated output
+results/
+graphs/
+
+# Auto-generated binary CSR cache
+csr_cache/
+
+# Extracted dataset directories (keep only the archives)
+Dataset/*/
+
+# Object files and build artifacts
+*.o
+*.a
+*.so
+*.out
+
+# Editor and IDE directories
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# macOS metadata
+.DS_Store
+
+# Jupyter notebooks checkpoints
+.ipynb_checkpoints/

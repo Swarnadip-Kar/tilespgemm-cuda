@@ -24,15 +24,21 @@ Implements and benchmarks the algorithms from:
 
 ### Install Python dependencies
 
-```bash
-# Using pip (system or venv)
-pip3 install scipy matplotlib numpy psutil
+A virtual environment is recommended to keep dependencies isolated. The `.venv/` directory is listed in `.gitignore` and will not be committed to the repository.
 
-# Or using a virtual environment (recommended)
+```bash
+# Create and activate a virtual environment (recommended)
 python3 -m venv .venv
-source .venv/bin/activate
+source .venv/bin/activate       # Linux/macOS
+# .venv\Scripts\activate        # Windows
+
 pip install scipy matplotlib numpy psutil
+
+# Alternatively, install into the system Python directly
+pip3 install scipy matplotlib numpy psutil
 ```
+
+> **Note:** Remember to activate the virtual environment (`source .venv/bin/activate`) each time you open a new terminal before running the benchmarks or graph scripts.
 
 ---
 
@@ -40,7 +46,7 @@ pip install scipy matplotlib numpy psutil
 
 ```bash
 # Clone / enter project directory
-cd POP_project/
+cd tilespgemm-cuda/
 
 # Build binaries, run all benchmarks, generate all graphs:
 make
@@ -91,7 +97,7 @@ make CUDA_HOME=/usr/local/cuda-12.0
 ## Output Structure
 
 ```
-POP_project/
+tilespgemm-cuda/
 ├── build/
 │   ├── row_spgemm          # RowSpGEMM binary
 │   └── tile_spgemm         # TileSpGEMM binary
@@ -208,7 +214,8 @@ make run graphs
 ## Project Structure
 
 ```
-POP_project/
+tilespgemm-cuda/
+├── .gitignore                   # Ignores .venv/, build/, results/, csr_cache/, graphs/
 ├── Makefile                     # Main build + run orchestration
 ├── README.md                    # This file
 ├── Dataset/                     # Input .tar.gz archives
