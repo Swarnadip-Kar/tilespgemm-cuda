@@ -255,89 +255,77 @@ static void tiled_free(TiledMatrix *T) {
  *  STEP 1 — cuSPARSE tile-level symbolic SpGEMM
  * ═══════════════════════════════════════════════════════════════════════ */
 static double step1_tile_structure(const TiledMatrix *A, const TiledMatrix *B,
-                                    int **h_tilePtrC_out, int **h_tileColIdxC_out,
-                                    int *numTilesC_out)
+                                   int **h_tilePtrC_out, int **h_tileColIdxC_out,
+                                   int *numTilesC_out, size_t *out_cusparse_workspace_bytes)
 {
+    cusparseHandle_t handle; CUSPARSE_CHECK(cusparseCreate(&handle));
+    
     int rowsAp=A->tilem, colsAp=A->tilen, nnzAp=A->numTiles;
     int rowsBp=B->tilem, colsBp=B->tilen, nnzBp=B->numTiles;
-
+    
+    // Allocate dummy values for cuSPARSE symbolic phase
     double *h_vA=(double*)malloc(nnzAp*sizeof(double));
     double *h_vB=(double*)malloc(nnzBp*sizeof(double));
     for(int i=0;i<nnzAp;i++) h_vA[i]=1.0;
     for(int i=0;i<nnzBp;i++) h_vB[i]=1.0;
-
-    int *d_rpA,*d_ciA; double *d_vA;
-    int *d_rpB,*d_ciB; double *d_vB;
-    CUDA_CHECK(cudaMalloc(&d_rpA,(rowsAp+1)*sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&d_ciA,nnzAp*sizeof(int)));
+    
+    double *d_vA, *d_vB;
     CUDA_CHECK(cudaMalloc(&d_vA, nnzAp*sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_rpB,(rowsBp+1)*sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&d_ciB,nnzBp*sizeof(int)));
     CUDA_CHECK(cudaMalloc(&d_vB, nnzBp*sizeof(double)));
-    CUDA_CHECK(cudaMemcpy(d_rpA,A->h_tilePtr,   (rowsAp+1)*sizeof(int),cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_ciA,A->h_tileColIdx, nnzAp*sizeof(int),    cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_vA, h_vA,            nnzAp*sizeof(double), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_rpB,B->h_tilePtr,   (rowsBp+1)*sizeof(int),cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_ciB,B->h_tileColIdx, nnzBp*sizeof(int),    cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_vB, h_vB,            nnzBp*sizeof(double), cudaMemcpyHostToDevice));
-    free(h_vA); free(h_vB);
+    CUDA_CHECK(cudaMemcpy(d_vA, h_vA, nnzAp*sizeof(double), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_vB, h_vB, nnzBp*sizeof(double), cudaMemcpyHostToDevice));
 
-    cusparseHandle_t handle; CUSPARSE_CHECK(cusparseCreate(&handle));
-    cusparseSpMatDescr_t mA,mB,mC;
-    CUSPARSE_CHECK(cusparseCreateCsr(&mA,rowsAp,colsAp,nnzAp,d_rpA,d_ciA,d_vA,
-        CUSPARSE_INDEX_32I,CUSPARSE_INDEX_32I,CUSPARSE_INDEX_BASE_ZERO,CUDA_R_64F));
-    CUSPARSE_CHECK(cusparseCreateCsr(&mB,rowsBp,colsBp,nnzBp,d_rpB,d_ciB,d_vB,
-        CUSPARSE_INDEX_32I,CUSPARSE_INDEX_32I,CUSPARSE_INDEX_BASE_ZERO,CUDA_R_64F));
-    int *d_rpC; CUDA_CHECK(cudaMalloc(&d_rpC,(rowsAp+1)*sizeof(int)));
-    CUSPARSE_CHECK(cusparseCreateCsr(&mC,rowsAp,colsBp,0,d_rpC,NULL,NULL,
-        CUSPARSE_INDEX_32I,CUSPARSE_INDEX_32I,CUSPARSE_INDEX_BASE_ZERO,CUDA_R_64F));
+    cusparseSpMatDescr_t mA, mB, mC;
+    CUSPARSE_CHECK(cusparseCreateCsr(&mA, rowsAp, colsAp, nnzAp, A->d_tilePtr, A->d_tileColIdx, d_vA, CUSPARSE_INDEX_32I, CUSPARSE_INDEX_32I, CUSPARSE_INDEX_BASE_ZERO, CUDA_R_64F));
+    CUSPARSE_CHECK(cusparseCreateCsr(&mB, rowsBp, colsBp, nnzBp, B->d_tilePtr, B->d_tileColIdx, d_vB, CUSPARSE_INDEX_32I, CUSPARSE_INDEX_32I, CUSPARSE_INDEX_BASE_ZERO, CUDA_R_64F));
+    
+    int *d_rpC; CUDA_CHECK(cudaMalloc(&d_rpC, (rowsAp+1)*sizeof(int)));
+    CUSPARSE_CHECK(cusparseCreateCsr(&mC, rowsAp, colsBp, 0, d_rpC, NULL, NULL, CUSPARSE_INDEX_32I, CUSPARSE_INDEX_32I, CUSPARSE_INDEX_BASE_ZERO, CUDA_R_64F));
 
-    double alpha=1.0,beta=0.0;
+    double alpha=1.0, beta=0.0;
     cusparseSpGEMMDescr_t desc; CUSPARSE_CHECK(cusparseSpGEMM_createDescr(&desc));
-    /* BUG FIX (Bug 5): time the FULL step including work estimation */
-    double t0=wtime();
+
+    // -- ALLOCATIONS BEFORE TIMING --
     size_t bs1=0; void *b1=NULL;
-    CUSPARSE_CHECK(cusparseSpGEMM_workEstimation(handle,
-        CUSPARSE_OPERATION_NON_TRANSPOSE,CUSPARSE_OPERATION_NON_TRANSPOSE,
-        &alpha,mA,mB,&beta,mC,CUDA_R_64F,CUSPARSE_SPGEMM_DEFAULT,desc,&bs1,NULL));
-    CUDA_CHECK(cudaMalloc(&b1,bs1?bs1:1));
-    CUSPARSE_CHECK(cusparseSpGEMM_workEstimation(handle,
-        CUSPARSE_OPERATION_NON_TRANSPOSE,CUSPARSE_OPERATION_NON_TRANSPOSE,
-        &alpha,mA,mB,&beta,mC,CUDA_R_64F,CUSPARSE_SPGEMM_DEFAULT,desc,&bs1,b1));
+    CUSPARSE_CHECK(cusparseSpGEMM_workEstimation(handle, CUSPARSE_OPERATION_NON_TRANSPOSE, CUSPARSE_OPERATION_NON_TRANSPOSE, &alpha, mA, mB, &beta, mC, CUDA_R_64F, CUSPARSE_SPGEMM_DEFAULT, desc, &bs1, NULL));
+    CUDA_CHECK(cudaMalloc(&b1, bs1?bs1:1));
+    CUSPARSE_CHECK(cusparseSpGEMM_workEstimation(handle, CUSPARSE_OPERATION_NON_TRANSPOSE, CUSPARSE_OPERATION_NON_TRANSPOSE, &alpha, mA, mB, &beta, mC, CUDA_R_64F, CUSPARSE_SPGEMM_DEFAULT, desc, &bs1, b1));
+
     size_t bs2=0; void *b2=NULL;
-    CUSPARSE_CHECK(cusparseSpGEMM_compute(handle,
-        CUSPARSE_OPERATION_NON_TRANSPOSE,CUSPARSE_OPERATION_NON_TRANSPOSE,
-        &alpha,mA,mB,&beta,mC,CUDA_R_64F,CUSPARSE_SPGEMM_DEFAULT,desc,&bs2,NULL));
-    CUDA_CHECK(cudaMalloc(&b2,bs2?bs2:1));
+    CUSPARSE_CHECK(cusparseSpGEMM_compute(handle, CUSPARSE_OPERATION_NON_TRANSPOSE, CUSPARSE_OPERATION_NON_TRANSPOSE, &alpha, mA, mB, &beta, mC, CUDA_R_64F, CUSPARSE_SPGEMM_DEFAULT, desc, &bs2, NULL));
+    CUDA_CHECK(cudaMalloc(&b2, bs2?bs2:1));
 
-    CUSPARSE_CHECK(cusparseSpGEMM_compute(handle,
-        CUSPARSE_OPERATION_NON_TRANSPOSE,CUSPARSE_OPERATION_NON_TRANSPOSE,
-        &alpha,mA,mB,&beta,mC,CUDA_R_64F,CUSPARSE_SPGEMM_DEFAULT,desc,&bs2,b2));
-    int64_t nr,nc,nnzCp;
-    CUSPARSE_CHECK(cusparseSpMatGetSize(mC,&nr,&nc,&nnzCp));
+    int64_t rowsC, colsC, nnzCp;
+    CUSPARSE_CHECK(cusparseSpMatGetSize(mC, &rowsC, &colsC, &nnzCp));
+
     int *d_ciC; double *d_vC;
-    CUDA_CHECK(cudaMalloc(&d_ciC,(size_t)nnzCp*sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&d_vC, (size_t)nnzCp*sizeof(double)));
-    CUSPARSE_CHECK(cusparseCsrSetPointers(mC,d_rpC,d_ciC,d_vC));
-    CUSPARSE_CHECK(cusparseSpGEMM_copy(handle,
-        CUSPARSE_OPERATION_NON_TRANSPOSE,CUSPARSE_OPERATION_NON_TRANSPOSE,
-        &alpha,mA,mB,&beta,mC,CUDA_R_64F,CUSPARSE_SPGEMM_DEFAULT,desc));
+    CUDA_CHECK(cudaMalloc(&d_ciC, (size_t)nnzCp*sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_vC,  (size_t)nnzCp*sizeof(double)));
+    CUSPARSE_CHECK(cusparseCsrSetPointers(mC, d_rpC, d_ciC, d_vC));
+
+    *out_cusparse_workspace_bytes = bs1 + bs2; // Track peak memory overhead
+
     CUDA_CHECK(cudaDeviceSynchronize());
-    double elapsed_ms = (wtime()-t0)*1e3;
 
-    *h_tilePtrC_out    = (int*)malloc((rowsAp+1)*sizeof(int));
-    *h_tileColIdxC_out = (int*)malloc((size_t)nnzCp*sizeof(int));
-    CUDA_CHECK(cudaMemcpy(*h_tilePtrC_out,   d_rpC,(rowsAp+1)*sizeof(int),      cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(*h_tileColIdxC_out,d_ciC,(size_t)nnzCp*sizeof(int),   cudaMemcpyDeviceToHost));
+    // -- START TIMER (Computation Only) --
+    double t0 = wtime();
+    CUSPARSE_CHECK(cusparseSpGEMM_compute(handle, CUSPARSE_OPERATION_NON_TRANSPOSE, CUSPARSE_OPERATION_NON_TRANSPOSE, &alpha, mA, mB, &beta, mC, CUDA_R_64F, CUSPARSE_SPGEMM_DEFAULT, desc, &bs2, b2));
+    CUDA_CHECK(cudaDeviceSynchronize());
+    double elapsed_ms = (wtime() - t0) * 1e3;
+    // -- END TIMER --
+
     *numTilesC_out = (int)nnzCp;
+    *h_tilePtrC_out = (int*)malloc((rowsAp+1)*sizeof(int));
+    *h_tileColIdxC_out = (int*)malloc(nnzCp*sizeof(int));
+    
+    CUDA_CHECK(cudaMemcpy(*h_tilePtrC_out, d_rpC, (rowsAp+1)*sizeof(int), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(*h_tileColIdxC_out, d_ciC, nnzCp*sizeof(int), cudaMemcpyDeviceToHost));
 
-    cudaFree(b1);cudaFree(b2);
-    cudaFree(d_rpA);cudaFree(d_ciA);cudaFree(d_vA);
-    cudaFree(d_rpB);cudaFree(d_ciB);cudaFree(d_vB);
-    cudaFree(d_rpC);cudaFree(d_ciC);cudaFree(d_vC);
-    cusparseSpGEMM_destroyDescr(desc);
-    cusparseDestroySpMat(mA);cusparseDestroySpMat(mB);cusparseDestroySpMat(mC);
-    cusparseDestroy(handle);
+    cusparseDestroySpMat(mA); cusparseDestroySpMat(mB); cusparseDestroySpMat(mC);
+    cusparseSpGEMM_destroyDescr(desc); cusparseDestroy(handle);
+    cudaFree(d_vA); cudaFree(d_vB); free(h_vA); free(h_vB);
+    cudaFree(b1); cudaFree(b2); cudaFree(d_rpC); cudaFree(d_ciC); cudaFree(d_vC);
+
     return elapsed_ms;
 }
 
@@ -604,11 +592,16 @@ int main(int argc, char **argv)
     cudaEvent_t ev0, ev1;
     CUDA_CHECK(cudaEventCreate(&ev0)); CUDA_CHECK(cudaEventCreate(&ev1));
 
+    // START END-TO-END ALGORITHM TIMER
+    CUDA_CHECK(cudaDeviceSynchronize());
+    double t_start_algo = wtime();
+    
     /* ── STEP 1 ── */
     fprintf(stderr, "[TileSpGEMM] Step 1: Computing tile structure of C ...\n");
     int *h_tilePtrC=NULL, *h_tileColIdxC=NULL, numTilesC=0;
-    double t_step1_ms = step1_tile_structure(&TA, &TB,
-                                              &h_tilePtrC, &h_tileColIdxC, &numTilesC);
+    size_t cusparse_workspace_bytes = 0;
+    
+    double t_step1_ms = step1_tile_structure(&TA, &TB, &h_tilePtrC, &h_tileColIdxC, &numTilesC, &cusparse_workspace_bytes);
     fprintf(stderr, "[TileSpGEMM] Step 1 done: %d non-empty tiles in C, %.2f ms\n",
             numTilesC, t_step1_ms);
 
@@ -711,10 +704,14 @@ int main(int argc, char **argv)
             flops += 2LL * (A.rowPtr[A.colIdx[jp]+1] - A.rowPtr[A.colIdx[jp]]);
     double gflops = (flops / 1e9) / (t_total_ms / 1e3);
 
-    size_t peak_bytes =
-        2 * tiled_bytes +
-        (size_t)numTilesC * (sizeof(int)*2 + TILE_DIM*(sizeof(unsigned char)+sizeof(unsigned short))) +
-        (size_t)nnzC_total * (2*sizeof(unsigned char) + sizeof(double));
+    CUDA_CHECK(cudaDeviceSynchronize());
+    double t_total_ms = (wtime() - t_start_algo) * 1e3; // Replace old total time calculation
+
+    size_t peak_bytes = 2 * tiled_bytes + 
+                        ((size_t)(TA.tilem+1)*sizeof(int) + (size_t)numTilesC*sizeof(int)*2 + 
+                         (size_t)numTilesC*TILE_DIM*(sizeof(unsigned char)+sizeof(unsigned short)) + 
+                         (size_t)nnzC_total*(2*sizeof(unsigned char)+sizeof(double))) + 
+                        cusparse_workspace_bytes; // ADD THE WORKSPACE TO TOTAL MEMORY
 
     fprintf(stderr, "[TileSpGEMM] Total: %.2f ms, %.6f GFlops  upload=%.2f ms\n",
             t_total_ms, gflops, t_upload_ms);

@@ -4,17 +4,17 @@
  * No cuSPARSE — fully custom CUDA implementation of SpGEMM (C = A²).
  *
  * Algorithm: Hash-Based Row SpGEMM with open-addressing global hash tables
- *   Phase 1: upper_nnz_kernel  — per-row upper bound → size hash tables
- *   Phase 2: spgemm_hash_kernel — 1 warp/row, atomicCAS+atomicAdd into hash
- *   Phase 3: Thrust inclusive_scan — rowPtrC (prefix sum)
- *   Phase 4: collect_kernel — hash tables → sorted CSR output
+ * Phase 1: upper_nnz_kernel  — per-row upper bound → size hash tables
+ * Phase 2: spgemm_hash_kernel — 1 warp/row, atomicCAS+atomicAdd into hash
+ * Phase 3: Thrust inclusive_scan — rowPtrC (prefix sum)
+ * Phase 4: collect_kernel — hash tables → sorted CSR output
  *
  * Hash table design:
- *   - int   hash_keys[]  initialized to 0xFFFFFFFF = -1  (HASH_EMPTY)
- *   - double hash_vals[] initialized to 0x00             (0.0)
- *   - Open addressing with linear probing
- *   - atomicCAS claims key slot; atomicAdd accumulates value (sm_89 supports
- *     native double atomicAdd)
+ * - int   hash_keys[]  initialized to 0xFFFFFFFF = -1  (HASH_EMPTY)
+ * - double hash_vals[] initialized to 0x00             (0.0)
+ * - Open addressing with linear probing
+ * - atomicCAS claims key slot; atomicAdd accumulates value (sm_89 supports
+ * native double atomicAdd)
  * ─────────────────────────────────────────────────────────────────────────────
  */
 
@@ -87,8 +87,8 @@ static inline int next_pow2(int x) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
- *  PHASE 1 — upper-bound nnz per row of C
- *  upper_nnz[i] = Σ_{k: A[i,k]≠0} nnz(B row k)
+ * PHASE 1 — upper-bound nnz per row of C
+ * upper_nnz[i] = Σ_{k: A[i,k]≠0} nnz(B row k)
  * ═══════════════════════════════════════════════════════════════════════════ */
 __global__
 void upper_nnz_kernel(
@@ -104,13 +104,13 @@ void upper_nnz_kernel(
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
- *  PHASE 2 — Hash-based SpGEMM  (1 warp per row of C)
+ * PHASE 2 — Hash-based SpGEMM  (1 warp per row of C)
  *
- *  Each lane takes every WARP_SIZE-th nonzero of A[i,*].
- *  For each A[i,k] iterates over B[k,*]; inserts (j, A*B) into hash table.
- *    atomicCAS(&key, HASH_EMPTY, j)  → claim slot
- *    atomicAdd(&val, prod)           → accumulate (atomic double, sm≥6.0)
- *  After fill: all lanes count occupied slots, warp-reduce → nnzC[i].
+ * Each lane takes every WARP_SIZE-th nonzero of A[i,*].
+ * For each A[i,k] iterates over B[k,*]; inserts (j, A*B) into hash table.
+ * atomicCAS(&key, HASH_EMPTY, j)  → claim slot
+ * atomicAdd(&val, prod)           → accumulate (atomic double, sm≥6.0)
+ * After fill: all lanes count occupied slots, warp-reduce → nnzC[i].
  * ═══════════════════════════════════════════════════════════════════════════ */
 __global__
 void spgemm_hash_kernel(
@@ -158,7 +158,7 @@ void spgemm_hash_kernel(
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
- *  PHASE 4 — Collect hash entries → CSR (one thread/row, insertion sort)
+ * PHASE 4 — Collect hash entries → CSR (one thread/row, insertion sort)
  * ═══════════════════════════════════════════════════════════════════════════ */
 __global__
 void collect_kernel(
@@ -194,7 +194,7 @@ void collect_kernel(
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
- *  MAIN
+ * MAIN
  * ═══════════════════════════════════════════════════════════════════════════ */
 int main(int argc, char **argv)
 {
@@ -210,6 +210,14 @@ int main(int argc, char **argv)
     if (csr_load_binary(csr_path, &A) != 0) return 1;
     fprintf(stderr, "[RowSpGEMM] Matrix: %d x %d, nnz=%d\n", A.rows, A.cols, A.nnz);
     csr_upload(&A);
+
+    CUDA_CHECK(cudaDeviceSynchronize());
+    
+    // =========================================================================
+    // START END-TO-END ALGORITHM TIMER
+    // Includes Phase 1, batching overhead, Hash kernel, Prefix Sum, and Collect
+    // =========================================================================
+    double t_start_algo = wtime();
 
     /* ── Phase 1: upper-bound nnz per row ─────────────────────────────── */
     int *d_upper_nnz;
@@ -259,16 +267,9 @@ int main(int argc, char **argv)
     if (!h_nnzC || !h_ciC_all || !h_vC_all) {
         fprintf(stderr, "[RowSpGEMM] OOM (host output buffers)\n"); return 1; }
 
-    /* CUDA events for timing the entire compute (hash + collect, all batches) */
-    cudaEvent_t ev0, ev1, ev2, ev3;
-    CUDA_CHECK(cudaEventCreate(&ev0)); CUDA_CHECK(cudaEventCreate(&ev1));
-    CUDA_CHECK(cudaEventCreate(&ev2)); CUDA_CHECK(cudaEventCreate(&ev3));
-
-    double t_hash_total_ms = 0.0, t_collect_total_ms = 0.0;
-
     /* ════════════════════════════════════════════════════════════════════
-     *  Batched processing — process a range of rows at a time so that
-     *  hash table memory stays within HASH_MEM_BUDGET.
+     * Batched processing — process a range of rows at a time so that
+     * hash table memory stays within HASH_MEM_BUDGET.
      * ════════════════════════════════════════════════════════════════════ */
     int i0 = 0;
     while (i0 < A.rows) {
@@ -323,19 +324,13 @@ int main(int argc, char **argv)
         {
             int threads = WARPS_PER_BLK * WARP_SIZE;
             int blocks  = (batch_rows + WARPS_PER_BLK - 1) / WARPS_PER_BLK;
-            CUDA_CHECK(cudaDeviceSynchronize());
-            CUDA_CHECK(cudaEventRecord(ev0));
             spgemm_hash_kernel<<<blocks, threads>>>(
                 A.d_rowPtr + i0, A.d_colIdx, A.d_val,  /* A rows [i0,i1) */
                 A.d_rowPtr,      A.d_colIdx, A.d_val,  /* B = A (full)   */
                 d_hkeys_b, d_hvals_b, d_hoff_b, d_hcap_b,
                 d_nnzC_b, batch_rows);
-            CUDA_CHECK(cudaEventRecord(ev1));
-            CUDA_CHECK(cudaEventSynchronize(ev1));
             CUDA_CHECK(cudaGetLastError());
         }
-        float ft_hash; CUDA_CHECK(cudaEventElapsedTime(&ft_hash, ev0, ev1));
-        t_hash_total_ms += (double)ft_hash;
 
         /* Download nnzC for this batch */
         int *h_nnzC_b = (int*)malloc((size_t)batch_rows * sizeof(int));
@@ -372,17 +367,11 @@ int main(int argc, char **argv)
         CUDA_CHECK(cudaMalloc(&d_vC_b,  bnnzC_safe * sizeof(double)));
         {
             int blk = 256, grd = (batch_rows + blk - 1) / blk;
-            CUDA_CHECK(cudaDeviceSynchronize());
-            CUDA_CHECK(cudaEventRecord(ev2));
             collect_kernel<<<grd, blk>>>(
                 d_hkeys_b, d_hvals_b, d_hoff_b, d_hcap_b,
                 d_rowPtrC_b, d_ciC_b, d_vC_b, batch_rows);
-            CUDA_CHECK(cudaEventRecord(ev3));
-            CUDA_CHECK(cudaEventSynchronize(ev3));
             CUDA_CHECK(cudaGetLastError());
         }
-        float ft_collect; CUDA_CHECK(cudaEventElapsedTime(&ft_collect, ev2, ev3));
-        t_collect_total_ms += (double)ft_collect;
 
         /* Download batch CSR to host buffer */
         if (batch_nnzC > 0) {
@@ -412,13 +401,19 @@ int main(int argc, char **argv)
 
     fprintf(stderr, "[RowSpGEMM] nnzC = %d\n", nnzC);
 
-    /* ── Timing + stats ──────────────────────────────────────────────── */
-    double time_ms = t_hash_total_ms + t_collect_total_ms;
+    CUDA_CHECK(cudaDeviceSynchronize()); // Ensure all GPU work is totally finished
+    
+    // =========================================================================
+    // END END-TO-END ALGORITHM TIMER
+    // =========================================================================
+    double time_ms = (wtime() - t_start_algo) * 1e3;
 
+    /* ── Timing + stats ──────────────────────────────────────────────── */
     long long flops = 0;
     for (int i = 0; i < A.rows; i++)
         for (int jp = A.rowPtr[i]; jp < A.rowPtr[i+1]; jp++)
             flops += 2LL * (A.rowPtr[A.colIdx[jp]+1] - A.rowPtr[A.colIdx[jp]]);
+    
     double gflops = (flops / 1e9) / (time_ms / 1e3);
 
     size_t mem_bytes =
@@ -433,8 +428,8 @@ int main(int argc, char **argv)
         (size_t)(A.rows + 1) * sizeof(int);
 
     fprintf(stderr,
-            "[RowSpGEMM] hash=%.3f ms  collect=%.3f ms  total=%.3f ms  %.4f GFlops\n",
-            t_hash_total_ms, t_collect_total_ms, time_ms, gflops);
+            "[RowSpGEMM] total algorithm time = %.3f ms  %.4f GFlops\n",
+            time_ms, gflops);
 
     printf("{\"algo\":\"RowSpGEMM\",\"matrix\":\"%s\","
            "\"time_ms\":%.4f,\"gflops\":%.6f,"
@@ -446,7 +441,6 @@ int main(int argc, char **argv)
     free(A.rowPtr); free(A.colIdx); free(A.val);
     free(h_hcap);
     free(h_nnzC); free(h_ciC_all); free(h_vC_all); free(h_rowPtrC);
-    cudaEventDestroy(ev0); cudaEventDestroy(ev1);
-    cudaEventDestroy(ev2); cudaEventDestroy(ev3);
+    
     return 0;
 }
