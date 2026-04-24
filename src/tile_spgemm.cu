@@ -81,6 +81,9 @@ static int csr_load_binary(const char *path, CsrMatrix *A) {
    512 supports very dense tile structures. */
 #define MAX_PAIRS        512
 
+/* Number of C-tiles for which per-tile diagnostics are collected in Step 2. */
+#define DBG_TILES        4
+
 /* ═══════════════════════════════════════════════════════════════════════
  *  TILED SPARSE FORMAT
  * ═══════════════════════════════════════════════════════════════════════ */
@@ -365,8 +368,19 @@ static double step1_tile_structure(const TiledMatrix *A, const TiledMatrix *B,
  *  BUG FIX (Bug 3): Removed dead parameters A_tileNnz, B_tileNnz,
  *    A_rowPtr, B_rowPtr (were suppressed with (void) in the old kernel).
  *
+ *  BUG FIX (sync): The original early `return` when wid >= numTilesC caused
+ *    threads in the same block (but belonging to different warps) to diverge
+ *    at __syncthreads(), which is undefined behaviour in CUDA.  Fixed by
+ *    removing the early return and guarding all tile-specific work with
+ *    `if (wid < numTilesC)` instead; __syncthreads() is now always reached
+ *    by every thread in the block.
+ *
  *  OPTIMIZATION: Register-local mask accumulation per lane followed by
  *    warp-shuffle XOR reduction — eliminates all atomicOr on shared memory.
+ *
+ *  DIAGNOSTICS: Lightweight atomic counters (tiles processed, tiles with at
+ *    least one A/B pair, total pairs) plus per-tile detail for the first
+ *    DBG_TILES tiles are written to optional device arrays when non-NULL.
  * ═══════════════════════════════════════════════════════════════════════ */
 __global__
 void step2_symbolic_kernel(
@@ -376,55 +390,87 @@ void step2_symbolic_kernel(
     const unsigned short *B_mask,
     const int            *C_tileColIdx, const int *d_tile_row,
     int *C_tileNnz, unsigned char *C_rowPtr, unsigned short *C_mask,
-    int numTilesC)
+    int numTilesC,
+    int *d_dbg_tiles_processed,   /* [1] atomic counter — tiles processed   */
+    int *d_dbg_tiles_with_pairs,  /* [1] atomic counter — tiles with ≥1 pair*/
+    int *d_dbg_total_pairs,       /* [1] atomic counter — total pairs found  */
+    int *d_dbg_tile_info)         /* [DBG_TILES*4] {tile_i,tile_j,lenA,pairs}*/
 {
     int tid  = blockIdx.x * blockDim.x + threadIdx.x;
     int wid  = tid  / WARP_SIZE;
     int lane = tid  % WARP_SIZE;
     int wb   = threadIdx.x / WARP_SIZE;
-    if (wid >= numTilesC) return;
 
-    int tile_i = d_tile_row[wid];
-    int tile_j = C_tileColIdx[wid];
-    int lenA   = A_tilePtr[tile_i+1] - A_tilePtr[tile_i];
-    int baseA  = A_tilePtr[tile_i];
+    /* Default values for out-of-range warps (avoid undefined reads). */
+    int tile_i = 0, tile_j = 0, lenA = 0, baseA = 0;
+    int lane_pairs = 0;
 
     /* Each lane accumulates its own contribution into register-local masks */
     unsigned int local_mask[TILE_DIM];
     for (int r = 0; r < TILE_DIM; r++) local_mask[r] = 0u;
 
-    for (int ia = lane; ia < lenA; ia += WARP_SIZE) {
-        int col_a = A_tileColIdx[baseA + ia];  /* k = intermediate tile-col */
+    /* Guard all tile work — do NOT use early return here because
+       __syncthreads() further below must be reached by all threads. */
+    if (wid < numTilesC) {
+        tile_i = d_tile_row[wid];
+        tile_j = C_tileColIdx[wid];
+        lenA   = A_tilePtr[tile_i+1] - A_tilePtr[tile_i];
+        baseA  = A_tilePtr[tile_i];
 
-        /* BUG FIX (Bug 1): search B's tile-ROW col_a for tile-col tile_j */
-        int lenB_k  = B_tilePtr[col_a+1] - B_tilePtr[col_a];
-        int baseB_k = B_tilePtr[col_a];
-        int lo=0, hi=lenB_k-1, found_b=-1;
-        while (lo<=hi) {
-            int mid=(lo+hi)>>1, v=B_tileColIdx[baseB_k+mid];
-            if      (v==tile_j) { found_b=mid; break; }
-            else if (v< tile_j)   lo=mid+1;
-            else                   hi=mid-1;
-        }
-        if (found_b < 0) continue;
+        for (int ia = lane; ia < lenA; ia += WARP_SIZE) {
+            int col_a = A_tileColIdx[baseA + ia];  /* k = intermediate tile-col */
 
-        int posA = baseA + ia;
-        int posB = baseB_k + found_b;
-
-        /* Accumulate column contributions into local register masks */
-        for (int r = 0; r < TILE_DIM; r++) {
-            unsigned short mA = A_mask[(size_t)posA * TILE_DIM + r];
-            unsigned int contrib = 0u;
-            while (mA) {
-                int c = __ffs((int)(unsigned int)mA) - 1;
-                mA &= (unsigned short)(mA - 1);
-                contrib |= (unsigned int)B_mask[(size_t)posB * TILE_DIM + c];
+            /* BUG FIX (Bug 1): search B's tile-ROW col_a for tile-col tile_j */
+            int lenB_k  = B_tilePtr[col_a+1] - B_tilePtr[col_a];
+            int baseB_k = B_tilePtr[col_a];
+            int lo=0, hi=lenB_k-1, found_b=-1;
+            while (lo<=hi) {
+                int mid=(lo+hi)>>1, v=B_tileColIdx[baseB_k+mid];
+                if      (v==tile_j) { found_b=mid; break; }
+                else if (v< tile_j)   lo=mid+1;
+                else                   hi=mid-1;
             }
-            local_mask[r] |= contrib;
+            if (found_b < 0) continue;
+
+            lane_pairs++;
+            int posA = baseA + ia;
+            int posB = baseB_k + found_b;
+
+            /* Accumulate column contributions into local register masks */
+            for (int r = 0; r < TILE_DIM; r++) {
+                unsigned short mA = A_mask[(size_t)posA * TILE_DIM + r];
+                unsigned int contrib = 0u;
+                while (mA) {
+                    int c = __ffs((int)(unsigned int)mA) - 1;
+                    mA &= (unsigned short)(mA - 1);
+                    contrib |= (unsigned int)B_mask[(size_t)posB * TILE_DIM + c];
+                }
+                local_mask[r] |= contrib;
+            }
         }
     }
 
-    /* Warp-reduce local_mask via shuffle XOR — no shared-memory atomics */
+    /* Warp-reduce lane_pairs to lane 0 for diagnostics */
+    unsigned int warp_pairs = (unsigned int)lane_pairs;
+    for (int off = WARP_SIZE/2; off > 0; off >>= 1)
+        warp_pairs += __shfl_xor_sync(0xFFFFFFFFu, warp_pairs, off);
+
+    /* Update debug counters — lane 0 of each valid warp */
+    if (wid < numTilesC && lane == 0) {
+        atomicAdd(d_dbg_tiles_processed, 1);
+        if (warp_pairs > 0u) atomicAdd(d_dbg_tiles_with_pairs, 1);
+        atomicAdd(d_dbg_total_pairs, (int)warp_pairs);
+        if (wid < DBG_TILES) {
+            d_dbg_tile_info[wid*4 + 0] = tile_i;
+            d_dbg_tile_info[wid*4 + 1] = tile_j;
+            d_dbg_tile_info[wid*4 + 2] = lenA;
+            d_dbg_tile_info[wid*4 + 3] = (int)warp_pairs;
+        }
+    }
+
+    /* Warp-reduce local_mask via shuffle XOR — no shared-memory atomics.
+       __syncthreads() below must be reached by ALL threads in the block,
+       so we do NOT return early above. */
     __shared__ unsigned int s_mask[WARPS_PER_BLOCK][TILE_DIM];
     for (int r = 0; r < TILE_DIM; r++) {
         unsigned int v = local_mask[r];
@@ -432,14 +478,14 @@ void step2_symbolic_kernel(
             v |= __shfl_xor_sync(0xFFFFFFFFu, v, off);
         if (lane == 0) s_mask[wb][r] = v;
     }
-    __syncthreads();
+    __syncthreads();  /* all threads must reach this — no early return above */
 
-    if (lane < TILE_DIM)
+    if (wid < numTilesC && lane < TILE_DIM)
         C_mask[(size_t)wid * TILE_DIM + lane] =
             (unsigned short)(s_mask[wb][lane] & 0xFFFFu);
-    __syncthreads();
+    __syncthreads();  /* guard s_mask reads below from out-of-order stores */
 
-    if (lane == 0) {
+    if (wid < numTilesC && lane == 0) {
         int total = 0; unsigned char acc = 0;
         for (int r = 0; r < TILE_DIM; r++) {
             C_rowPtr[(size_t)wid * TILE_DIM + r] = acc;
@@ -479,11 +525,16 @@ void step3_numeric_kernel(
     const unsigned char *C_rowPtr, const unsigned short *C_mask,
     const int *d_tile_row,
     unsigned char *C_rowIdx_out, unsigned char *C_colIdx_out, double *C_val_out,
-    int numTilesC)
+    int numTilesC,
+    int *d_step3_entered)                            /* diagnostic: entry counter */
 {
     int tile_idx = blockIdx.x;
     int slot     = threadIdx.x;
     if (tile_idx >= numTilesC) return;
+
+    /* Device-side diagnostic: thread (0,0) of first active block signals kernel entered */
+    if (blockIdx.x == 0 && threadIdx.x == 0)
+        atomicAdd(d_step3_entered, 1);
 
     int r = slot >> 4;
     int c = slot & 15;
@@ -655,6 +706,33 @@ int main(int argc, char **argv)
 
     /* ── STEP 2 ── */
     fprintf(stderr, "[TileSpGEMM] Step 2: Symbolic phase (bitmask, rowPtr per tile) ...\n");
+
+    /* Pre-launch sanity: print C tile structure so mismatches are visible. */
+    {
+        int ptr_preview_n = (TA.tilem < 8) ? TA.tilem : 8;
+        fprintf(stderr, "[Step2-Diag] numTilesC=%d  tilem=%d  tilen=%d\n",
+                numTilesC, TA.tilem, TB.tilen);
+        fprintf(stderr, "[Step2-Diag] h_tilePtrC[0..%d]:", ptr_preview_n);
+        for (int i = 0; i <= ptr_preview_n; i++) fprintf(stderr, " %d", h_tilePtrC[i]);
+        fprintf(stderr, "\n");
+        int col_preview_n = (numTilesC < 16) ? numTilesC : 16;
+        fprintf(stderr, "[Step2-Diag] h_tileColIdxC[0..%d]:", col_preview_n);
+        for (int i = 0; i < col_preview_n; i++) fprintf(stderr, " %d", h_tileColIdxC[i]);
+        fprintf(stderr, "\n");
+    }
+
+    /* Debug device counters for Step 2 — allocated before the timed window. */
+    int *d_dbg_tiles_processed, *d_dbg_tiles_with_pairs, *d_dbg_total_pairs;
+    int *d_dbg_tile_info;
+    CUDA_CHECK(cudaMalloc(&d_dbg_tiles_processed,  sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_dbg_tiles_with_pairs, sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_dbg_total_pairs,      sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_dbg_tile_info,        DBG_TILES * 4 * sizeof(int)));
+    CUDA_CHECK(cudaMemset(d_dbg_tiles_processed,  0, sizeof(int)));
+    CUDA_CHECK(cudaMemset(d_dbg_tiles_with_pairs, 0, sizeof(int)));
+    CUDA_CHECK(cudaMemset(d_dbg_total_pairs,      0, sizeof(int)));
+    CUDA_CHECK(cudaMemset(d_dbg_tile_info,        0, DBG_TILES * 4 * sizeof(int)));
+
     int *d_tileNnzPrefixC;
     int nnzC_total = 0;
     double t_step2_ms;
@@ -672,7 +750,9 @@ int main(int argc, char **argv)
             TA.d_tilePtr, TA.d_tileColIdx, TA.d_mask,
             TB.d_tilePtr, TB.d_tileColIdx, TB.d_mask,
             d_tileColIdxC, d_tile_row,
-            d_tileNnzC, d_rowPtrC, d_maskC, numTilesC);
+            d_tileNnzC, d_rowPtrC, d_maskC, numTilesC,
+            d_dbg_tiles_processed, d_dbg_tiles_with_pairs,
+            d_dbg_total_pairs, d_dbg_tile_info);
         CUDA_CHECK(cudaPeekAtLastError());
         CUDA_CHECK(cudaDeviceSynchronize());
         CUDA_CHECK(cudaEventRecord(ev1));
@@ -701,6 +781,27 @@ int main(int argc, char **argv)
     fprintf(stderr, "[TileSpGEMM] Step 2 done: nnzC=%d (in %d/%d non-empty tiles), %.2f ms\n",
             nnzC_total, numTilesC, numTilesC, t_step2_ms);
 
+    /* Copy and print Step 2 debug counters */
+    {
+        int h_processed = 0, h_with_pairs = 0, h_total_pairs = 0;
+        int h_tile_info[DBG_TILES * 4];
+        CUDA_CHECK(cudaMemcpy(&h_processed,   d_dbg_tiles_processed,  sizeof(int), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(&h_with_pairs,  d_dbg_tiles_with_pairs, sizeof(int), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(&h_total_pairs, d_dbg_total_pairs,      sizeof(int), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(h_tile_info, d_dbg_tile_info, DBG_TILES * 4 * sizeof(int), cudaMemcpyDeviceToHost));
+        fprintf(stderr, "[Step2-Diag] tiles_processed=%d  tiles_with_pairs=%d  total_pairs=%d\n",
+                h_processed, h_with_pairs, h_total_pairs);
+        int show = (numTilesC < DBG_TILES) ? numTilesC : DBG_TILES;
+        for (int i = 0; i < show; i++)
+            fprintf(stderr, "[Step2-Diag] tile[%d]: tile_i=%d  tile_j=%d  lenA=%d  found_pairs=%d\n",
+                    i, h_tile_info[i*4+0], h_tile_info[i*4+1],
+                    h_tile_info[i*4+2], h_tile_info[i*4+3]);
+    }
+    cudaFree(d_dbg_tiles_processed);
+    cudaFree(d_dbg_tiles_with_pairs);
+    cudaFree(d_dbg_total_pairs);
+    cudaFree(d_dbg_tile_info);
+
     /* Allocate C numeric output */
     size_t nnzC_safe = (nnzC_total > 0) ? (size_t)nnzC_total : 1;
     unsigned char *d_rowIdxC, *d_colIdxC;
@@ -710,31 +811,60 @@ int main(int argc, char **argv)
     CUDA_CHECK(cudaMalloc(&d_valC,    nnzC_safe * sizeof(double)));
 
    /* ── STEP 3 ── */
-    fprintf(stderr, "[TileSpGEMM] Step 3: GPU numeric (256 threads/tile) ...\n");
+    /* Allocate device-side diagnostic counter (confirms kernel entered) */
+    int *d_step3_entered = NULL;
+    CUDA_CHECK(cudaMalloc(&d_step3_entered, sizeof(int)));
+    CUDA_CHECK(cudaMemset(d_step3_entered, 0, sizeof(int)));
+
     double t_step3_ms = 0.0;
+    int    blocks     = (numTilesC > 0) ? numTilesC : 1;
     {
-        int blocks = (numTilesC > 0) ? numTilesC : 1;
-        
+        int threads = TILE_SIZE;
+
+        fprintf(stderr,
+                "[TileSpGEMM] Step 3 LAUNCH: blocks=%d  threads=%d  "
+                "numTilesC=%d  nnzC_total=%d\n",
+                blocks, threads, numTilesC, nnzC_total);
+
         /* Sync before wall-clock start to ensure GPU is completely idle */
         CUDA_CHECK(cudaDeviceSynchronize());
         double t_step3_wall_start = wtime();
 
-        step3_numeric_kernel<<<blocks, TILE_SIZE>>>(
+        step3_numeric_kernel<<<blocks, threads>>>(
             TA.d_tilePtr, TA.d_tileColIdx, TA.d_tileNnzPrefix,
             TA.d_rowPtr,  TA.d_colIdx, TA.d_val,
             TB.d_tilePtr, TB.d_tileColIdx, TB.d_tileNnzPrefix,
             TB.d_rowPtr,  TB.d_colIdx, TB.d_val, TB.d_mask,
             d_tileColIdxC, d_tileNnzPrefixC, d_rowPtrC, d_maskC, d_tile_row,
-            d_rowIdxC, d_colIdxC, d_valC, numTilesC);
+            d_rowIdxC, d_colIdxC, d_valC, numTilesC, d_step3_entered);
+
+        /* Immediate post-launch error check (catches bad launch configs) */
         CUDA_CHECK(cudaPeekAtLastError());
-            
-        /* Sync to block CPU until the Step 3 kernel is entirely finished */
+        fprintf(stderr, "[TileSpGEMM] Step 3 post-launch: kernel enqueued OK\n");
+
+        /* Wait for kernel completion and catch any runtime errors */
         CUDA_CHECK(cudaDeviceSynchronize());
-        CUDA_CHECK(cudaGetLastError());
-        
+
         t_step3_ms = (wtime() - t_step3_wall_start) * 1e3;
+        fprintf(stderr, "[TileSpGEMM] Step 3 post-sync:  completed in %.2f ms\n",
+                t_step3_ms);
     }
-    fprintf(stderr, "[TileSpGEMM] Step 3 done: nnzC=%d, %.2f ms\n", nnzC_total, t_step3_ms);
+
+    /* Copy back entry counter and report */
+    int h_step3_entered = 0;
+    CUDA_CHECK(cudaMemcpy(&h_step3_entered, d_step3_entered, sizeof(int),
+                          cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaFree(d_step3_entered));
+
+    fprintf(stderr,
+            "[TileSpGEMM] Step 3 STATS: entered=%d  numTilesC=%d  "
+            "blocks=%d  threads=%d  nnzC=%d  time=%.2f ms\n",
+            h_step3_entered, numTilesC,
+            blocks, TILE_SIZE,
+            nnzC_total, t_step3_ms);
+    if (h_step3_entered == 0 && numTilesC > 0)
+        fprintf(stderr, "[TileSpGEMM] WARNING: Step 3 kernel entered=0 "
+                        "— kernel may not have executed any work!\n");
 
    /* ── Stats & End-to-End Timing ── */
     CUDA_CHECK(cudaDeviceSynchronize());
