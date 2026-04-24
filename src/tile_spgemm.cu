@@ -693,15 +693,15 @@ int main(int argc, char **argv)
 
     /* Pre-launch sanity: print C tile structure so mismatches are visible. */
     {
-        int prev_ptr = (TA.tilem < 8) ? TA.tilem : 8;
+        int ptr_preview_n = (TA.tilem < 8) ? TA.tilem : 8;
         fprintf(stderr, "[Step2-Diag] numTilesC=%d  tilem=%d  tilen=%d\n",
                 numTilesC, TA.tilem, TB.tilen);
-        fprintf(stderr, "[Step2-Diag] h_tilePtrC[0..%d]:", prev_ptr);
-        for (int i = 0; i <= prev_ptr; i++) fprintf(stderr, " %d", h_tilePtrC[i]);
+        fprintf(stderr, "[Step2-Diag] h_tilePtrC[0..%d]:", ptr_preview_n);
+        for (int i = 0; i <= ptr_preview_n; i++) fprintf(stderr, " %d", h_tilePtrC[i]);
         fprintf(stderr, "\n");
-        int prev_col = (numTilesC < 16) ? numTilesC : 16;
-        fprintf(stderr, "[Step2-Diag] h_tileColIdxC[0..%d]:", prev_col);
-        for (int i = 0; i < prev_col; i++) fprintf(stderr, " %d", h_tileColIdxC[i]);
+        int col_preview_n = (numTilesC < 16) ? numTilesC : 16;
+        fprintf(stderr, "[Step2-Diag] h_tileColIdxC[0..%d]:", col_preview_n);
+        for (int i = 0; i < col_preview_n; i++) fprintf(stderr, " %d", h_tileColIdxC[i]);
         fprintf(stderr, "\n");
     }
 
