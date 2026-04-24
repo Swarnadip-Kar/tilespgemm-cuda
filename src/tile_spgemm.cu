@@ -285,16 +285,31 @@ static double step1_tile_structure(const TiledMatrix *A, const TiledMatrix *B,
     double alpha=1.0, beta=0.0;
     cusparseSpGEMMDescr_t desc; CUSPARSE_CHECK(cusparseSpGEMM_createDescr(&desc));
 
-    // -- ALLOCATIONS BEFORE TIMING --
+    // -- PRE-TIMING SETUP: lightweight NULL sizing calls + workspace allocs --
+    // workEstimation(NULL): cheap query that only returns the required buffer size.
+    // workEstimation(b1):   ACTUAL WORK — cuSPARSE discovers C's tile structure here.
+    // These two calls cannot be reordered; compute(NULL) must follow workEstimation(b1)
+    // because cuSPARSE needs the structure info to size the compute workspace.
     size_t bs1=0; void *b1=NULL;
     CUSPARSE_CHECK(cusparseSpGEMM_workEstimation(handle, CUSPARSE_OPERATION_NON_TRANSPOSE, CUSPARSE_OPERATION_NON_TRANSPOSE, &alpha, mA, mB, &beta, mC, CUDA_R_64F, CUSPARSE_SPGEMM_DEFAULT, desc, &bs1, NULL));
     CUDA_CHECK(cudaMalloc(&b1, bs1?bs1:1));
+
+    // Sync before starting the timer so no prior GPU work leaks in.
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    // -- START TIMER: covers both actual-work cuSPARSE calls --
+    double t0 = wtime();
+
+    // Call 1: actual work estimation (finds C's nonzero structure — often the
+    // costliest part of Step 1 and was previously missing from the timer).
     CUSPARSE_CHECK(cusparseSpGEMM_workEstimation(handle, CUSPARSE_OPERATION_NON_TRANSPOSE, CUSPARSE_OPERATION_NON_TRANSPOSE, &alpha, mA, mB, &beta, mC, CUDA_R_64F, CUSPARSE_SPGEMM_DEFAULT, desc, &bs1, b1));
 
+    // Sizing call for compute buffer (must come after workEstimation(b1)).
     size_t bs2=0; void *b2=NULL;
     CUSPARSE_CHECK(cusparseSpGEMM_compute(handle, CUSPARSE_OPERATION_NON_TRANSPOSE, CUSPARSE_OPERATION_NON_TRANSPOSE, &alpha, mA, mB, &beta, mC, CUDA_R_64F, CUSPARSE_SPGEMM_DEFAULT, desc, &bs2, NULL));
     CUDA_CHECK(cudaMalloc(&b2, bs2?bs2:1));
 
+    // Output size is only available after workEstimation(b1) has run.
     int64_t rowsC, colsC, nnzCp;
     CUSPARSE_CHECK(cusparseSpMatGetSize(mC, &rowsC, &colsC, &nnzCp));
 
@@ -305,10 +320,7 @@ static double step1_tile_structure(const TiledMatrix *A, const TiledMatrix *B,
 
     *out_cusparse_workspace_bytes = bs1 + bs2; // Track peak memory overhead
 
-    CUDA_CHECK(cudaDeviceSynchronize());
-
-    // -- START TIMER (Computation Only) --
-    double t0 = wtime();
+    // Call 2: actual numeric/structural compute.
     CUSPARSE_CHECK(cusparseSpGEMM_compute(handle, CUSPARSE_OPERATION_NON_TRANSPOSE, CUSPARSE_OPERATION_NON_TRANSPOSE, &alpha, mA, mB, &beta, mC, CUDA_R_64F, CUSPARSE_SPGEMM_DEFAULT, desc, &bs2, b2));
     CUDA_CHECK(cudaDeviceSynchronize());
     double elapsed_ms = (wtime() - t0) * 1e3;
@@ -632,11 +644,18 @@ int main(int argc, char **argv)
 
     /* ── STEP 2 ── */
     fprintf(stderr, "[TileSpGEMM] Step 2: Symbolic phase (bitmask, rowPtr per tile) ...\n");
+    int *d_tileNnzPrefixC;
+    int nnzC_total = 0;
+    double t_step2_ms;
     {
         int threads = WARPS_PER_BLOCK * WARP_SIZE;
         int blocks  = (numTilesC + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
         if (blocks < 1) blocks = 1;
+
+        /* Sync before wall-clock start so no prior GPU work leaks in. */
         CUDA_CHECK(cudaDeviceSynchronize());
+        double t_step2_wall_start = wtime();
+
         CUDA_CHECK(cudaEventRecord(ev0));
         step2_symbolic_kernel<<<blocks, threads>>>(
             TA.d_tilePtr, TA.d_tileColIdx, TA.d_mask,
@@ -646,23 +665,26 @@ int main(int argc, char **argv)
         CUDA_CHECK(cudaEventRecord(ev1));
         CUDA_CHECK(cudaEventSynchronize(ev1));
         CUDA_CHECK(cudaGetLastError());
-    }
-    float f2; CUDA_CHECK(cudaEventElapsedTime(&f2, ev0, ev1));
-    double t_step2_ms = (double)f2;
 
-    /* Thrust prefix sum on device */
-    int *d_tileNnzPrefixC;
-    CUDA_CHECK(cudaMalloc(&d_tileNnzPrefixC, (size_t)(numTilesC+1)*sizeof(int)));
-    CUDA_CHECK(cudaMemset(d_tileNnzPrefixC, 0, sizeof(int)));
-    if (numTilesC > 0) {
-        thrust::inclusive_scan(
-            thrust::device_ptr<int>(d_tileNnzC),
-            thrust::device_ptr<int>(d_tileNnzC + numTilesC),
-            thrust::device_ptr<int>(d_tileNnzPrefixC + 1));
+        /* Thrust prefix sum — logically part of the symbolic phase:
+           converts per-tile nnz counts into offsets needed by Step 3.
+           Previously ran OUTSIDE the timed window, understating t_step2_ms. */
+        CUDA_CHECK(cudaMalloc(&d_tileNnzPrefixC, (size_t)(numTilesC+1)*sizeof(int)));
+        CUDA_CHECK(cudaMemset(d_tileNnzPrefixC, 0, sizeof(int)));
+        if (numTilesC > 0) {
+            thrust::inclusive_scan(
+                thrust::device_ptr<int>(d_tileNnzC),
+                thrust::device_ptr<int>(d_tileNnzC + numTilesC),
+                thrust::device_ptr<int>(d_tileNnzPrefixC + 1));
+        }
+
+        /* Sync before stopping the wall clock so the Thrust work is counted. */
+        CUDA_CHECK(cudaDeviceSynchronize());
+        t_step2_ms = (wtime() - t_step2_wall_start) * 1e3;
+
+        CUDA_CHECK(cudaMemcpy(&nnzC_total, d_tileNnzPrefixC + numTilesC,
+                              sizeof(int), cudaMemcpyDeviceToHost));
     }
-    int nnzC_total = 0;
-    CUDA_CHECK(cudaMemcpy(&nnzC_total, d_tileNnzPrefixC + numTilesC,
-                          sizeof(int), cudaMemcpyDeviceToHost));
     fprintf(stderr, "[TileSpGEMM] Step 2 done: nnzC=%d (in %d/%d non-empty tiles), %.2f ms\n",
             nnzC_total, numTilesC, numTilesC, t_step2_ms);
 
