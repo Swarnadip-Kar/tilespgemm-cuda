@@ -66,7 +66,7 @@ NVCC_FLAGS    := -O3 -arch=$(GPU_ARCH) \
                  -lineinfo
 
 NVCC_LDFLAGS  := -L$(CUDA_LIB_DIR) \
-                 -lcusparse -lcudart \
+                 -lcudart \
                  -Xlinker -rpath,$(CUDA_LIB_DIR)
 
 # ── Targets ────────────────────────────────────────────────────────────────
