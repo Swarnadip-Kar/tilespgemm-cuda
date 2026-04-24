@@ -323,10 +323,6 @@ static double step1_tile_structure(const TiledMatrix *A, const TiledMatrix *B,
     CUSPARSE_CHECK(cusparseCreateCsr(&mC, rowsAp, colsBp, nnzCp, d_rpC, NULL, NULL, CUSPARSE_INDEX_32I, CUSPARSE_INDEX_32I, CUSPARSE_INDEX_BASE_ZERO, CUDA_R_64F));
     // --- BUG FIX ENDS HERE ---
 
-    // Output size is only available after workEstimation(b1) has run.
-    int64_t rowsC, colsC, nnzCp;
-    CUSPARSE_CHECK(cusparseSpMatGetSize(mC, &rowsC, &colsC, &nnzCp));
-
     int *d_ciC; double *d_vC;
     CUDA_CHECK(cudaMalloc(&d_ciC, (size_t)nnzCp*sizeof(int)));
     CUDA_CHECK(cudaMalloc(&d_vC,  (size_t)nnzCp*sizeof(double)));
