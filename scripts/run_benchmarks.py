@@ -53,7 +53,14 @@ def find_mtx_files():
         if not os.path.isdir(extract_dir):
             print(f"\n[Prepare] Extracting {os.path.basename(arch)} ...", flush=True)
             with tarfile.open(arch, 'r:gz') as tf:
-                tf.extractall(DATASET_DIR)
+                # Reject members with absolute paths or directory-traversal
+                # components to prevent writing outside DATASET_DIR.
+                safe_members = [
+                    m for m in tf.getmembers()
+                    if not os.path.isabs(m.name)
+                    and '..' not in m.name.split('/')
+                ]
+                tf.extractall(DATASET_DIR, members=safe_members)
         # Find .mtx inside
         mtx_candidates = glob.glob(os.path.join(DATASET_DIR, name, '*.mtx'))
         if not mtx_candidates:

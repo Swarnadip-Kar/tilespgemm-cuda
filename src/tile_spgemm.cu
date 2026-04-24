@@ -32,9 +32,6 @@
 #define TILE_SIZE       256         /* TILE_DIM * TILE_DIM                   */
 #define WARP_SIZE       32
 #define WARPS_PER_BLOCK 8           /* Step-2 kernel warps per block         */
-/* Max matched intermediate tile-pairs per output C-tile.
-   Supports matrices with up to TILE_DIM * MAX_PAIRS = 4096 columns.        */
-#define MAX_PAIRS       256
 
 /* ═══════════════════════════════════════════════════════════════════════════
  *  TILED SPARSE FORMAT
@@ -473,41 +470,32 @@ void step3_numeric_kernel(
     int baseA  = A_tilePtr[tile_i];
     int baseB  = B_tilePtr[tile_j];
 
-    /* Thread 0 finds all matched pairs; stored in shared memory */
-    __shared__ int s_posA[MAX_PAIRS];
-    __shared__ int s_posB[MAX_PAIRS];
-    __shared__ int s_npairs;
+    /* Process matched (A_ik, B_kj) pairs one at a time to remove the fixed-size
+       MAX_PAIRS cap that would silently drop results for matrices wider than
+       TILE_DIM * MAX_PAIRS columns.  Thread 0 binary-searches B for each A
+       tile; all 256 threads then accumulate their (r,c) slot for that pair. */
+    __shared__ int s_posB_cur;   /* position in B's tile list, or -1 if no match */
 
-    if (slot == 0) {
-        int np = 0;
-        for (int ia = 0; ia < lenA; ia++) {
+    double sum = 0.0;
+
+    for (int ia = 0; ia < lenA; ia++) {
+        if (slot == 0) {
             int col_a = A_tileColIdx[baseA + ia];
-            int lo = 0, hi = lenB - 1;
+            int lo = 0, hi = lenB - 1, found_b = -1;
             while (lo <= hi) {
                 int mid = (lo + hi) >> 1;
                 int v   = B_tileColIdx[baseB + mid];
-                if (v == col_a) {
-                    if (np < MAX_PAIRS) {
-                        s_posA[np] = baseA + ia;
-                        s_posB[np] = baseB + mid;
-                        np++;
-                    }
-                    break;
-                } else if (v < col_a) lo = mid + 1;
-                else                   hi = mid - 1;
+                if (v == col_a) { found_b = mid; break; }
+                else if (v < col_a) lo = mid + 1;
+                else                hi = mid - 1;
             }
+            s_posB_cur = (found_b >= 0) ? baseB + found_b : -1;
         }
-        s_npairs = np;
-    }
-    __syncthreads();
+        __syncthreads();
+        if (s_posB_cur < 0) continue;
 
-    /* Each thread independently accumulates C[r][c] */
-    double sum = 0.0;
-    int    np  = s_npairs;
-
-    for (int p = 0; p < np; p++) {
-        int posA   = s_posA[p];
-        int posB   = s_posB[p];
+        int posA   = baseA + ia;
+        int posB   = s_posB_cur;
         int offA   = A_tileNnzPrefix[posA];
         int nnzA_t = A_tileNnzPrefix[posA+1] - offA;
         int offB   = B_tileNnzPrefix[posB];
@@ -536,6 +524,12 @@ void step3_numeric_kernel(
                 }
             }
         }
+        /* Barrier before the next iteration: prevents thread 0 from overwriting
+           s_posB_cur for ia+1 while other warps are still reading s_posB_cur
+           above (at "int posB = s_posB_cur").  When s_posB_cur < 0, ALL threads
+           hit continue (same condition for every thread), so there is no warp
+           divergence on this barrier. */
+        __syncthreads();
     }
 
     /* Write output only if (r,c) is structurally present in C */
@@ -568,11 +562,20 @@ static void tiled_C_to_csr(
     for (int t = 0; t < numTilesC; t++) prefix[t+1] = prefix[t] + h_tileNnzC[t];
     int total = prefix[numTilesC];
 
+    /* Build O(1) tile-row lookup to avoid O(numTilesC × tilem) nested scans */
+    int *tile_row = (int *)malloc(numTilesC * sizeof(int));
+    if (!tile_row) {
+        fprintf(stderr, "tiled_C_to_csr: out of memory for tile_row (%d ints)\n", numTilesC);
+        *h_rowPtrOut = NULL; *h_colIdxOut = NULL; *h_valOut = NULL; *nnzOut = 0;
+        free(rowCnt); free(prefix);
+        return;
+    }
+    for (int tr = 0; tr < tilem; tr++)
+        for (int w = h_tilePtrC[tr]; w < h_tilePtrC[tr+1]; w++)
+            tile_row[w] = tr;
+
     for (int wid = 0; wid < numTilesC; wid++) {
-        int tile_i = -1;
-        for (int tr = 0; tr < tilem; tr++)
-            if (h_tilePtrC[tr] <= wid && wid < h_tilePtrC[tr+1]) { tile_i = tr; break; }
-        if (tile_i < 0) continue;
+        int tile_i = tile_row[wid];
         int base = prefix[wid];
         for (int k = 0; k < h_tileNnzC[wid]; k++) {
             int gr = tile_i * TILE_DIM + (int)h_rowIdxC[base + k];
@@ -587,10 +590,7 @@ static void tiled_C_to_csr(
     *h_valOut    = (double *)malloc(total*sizeof(double));
     int *cursor  = (int *)calloc(rows, sizeof(int));
     for (int wid = 0; wid < numTilesC; wid++) {
-        int tile_i = -1;
-        for (int tr = 0; tr < tilem; tr++)
-            if (h_tilePtrC[tr] <= wid && wid < h_tilePtrC[tr+1]) { tile_i = tr; break; }
-        if (tile_i < 0) continue;
+        int tile_i = tile_row[wid];
         int tile_j = h_tileColIdxC[wid];
         int base   = prefix[wid];
         for (int k = 0; k < h_tileNnzC[wid]; k++) {
@@ -602,6 +602,7 @@ static void tiled_C_to_csr(
             (*h_valOut)[p]    = h_valC[base + k];
         }
     }
+    free(tile_row);
     free(rowCnt); free(prefix); free(cursor);
     (void)tilen;
 }
@@ -696,6 +697,24 @@ int main(int argc, char **argv)
         int threads = WARPS_PER_BLOCK * WARP_SIZE;
         int blocks  = (numTilesC + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
         if (blocks < 1) blocks = 1;
+
+        /* Warm-up run (not timed) — brings kernel code and data into GPU caches */
+        step2_symbolic_kernel<<<blocks, threads>>>(
+            TA.d_tilePtr, TA.d_tileColIdx, TA.d_tileNnz,
+            TA.d_rowPtr, TA.d_mask,
+            TB.d_tilePtr, TB.d_tileColIdx, TB.d_tileNnz,
+            TB.d_rowPtr, TB.d_mask,
+            d_tileColIdxC, d_tile_row,
+            d_tileNnzC, d_rowPtrC, d_maskC,
+            numTilesC);
+        CUDA_CHECK(cudaDeviceSynchronize());
+
+        /* Reset accumulator outputs so the timed run starts from a clean slate */
+        CUDA_CHECK(cudaMemset(d_tileNnzC, 0, numTilesC*sizeof(int)));
+        CUDA_CHECK(cudaMemset(d_rowPtrC,  0, numTilesC*TILE_DIM*sizeof(unsigned char)));
+        CUDA_CHECK(cudaMemset(d_maskC,    0, numTilesC*TILE_DIM*sizeof(unsigned short)));
+
+        /* Timed run */
         CUDA_CHECK(cudaDeviceSynchronize());
         CUDA_CHECK(cudaEventRecord(ev0));
         step2_symbolic_kernel<<<blocks, threads>>>(
@@ -741,6 +760,20 @@ int main(int argc, char **argv)
     fprintf(stderr, "[TileSpGEMM] Step 3: GPU numeric (256 threads/tile) ...\n");
     {
         int blocks = (numTilesC > 0) ? numTilesC : 1;
+
+        /* Warm-up run (not timed) — step3 writes each slot exactly once so
+           running twice produces the same correct output; no reset needed. */
+        step3_numeric_kernel<<<blocks, TILE_SIZE>>>(
+            TA.d_tilePtr, TA.d_tileColIdx, TA.d_tileNnzPrefix,
+            TA.d_rowPtr,  TA.d_colIdx, TA.d_val,
+            TB.d_tilePtr, TB.d_tileColIdx, TB.d_tileNnzPrefix,
+            TB.d_rowPtr,  TB.d_colIdx, TB.d_val,
+            d_tileColIdxC, d_tileNnzPrefixC, d_rowPtrC, d_maskC, d_tile_row,
+            d_rowIdxC, d_colIdxC, d_valC,
+            numTilesC);
+        CUDA_CHECK(cudaDeviceSynchronize());
+
+        /* Timed run */
         CUDA_CHECK(cudaDeviceSynchronize());
         CUDA_CHECK(cudaEventRecord(ev0));
         step3_numeric_kernel<<<blocks, TILE_SIZE>>>(
@@ -807,12 +840,14 @@ int main(int argc, char **argv)
                        &h_rpC, &h_ciC, &h_vC, &nnzCSR);
         FILE *fp = fopen(save_path, "wb");
         if (fp) {
-            fwrite(&A.rows, sizeof(int),    1,       fp);
-            fwrite(&A.cols, sizeof(int),    1,       fp);
-            fwrite(&nnzCSR, sizeof(int),    1,       fp);
-            fwrite(h_rpC,   sizeof(int),    A.rows+1,fp);
-            fwrite(h_ciC,   sizeof(int),    nnzCSR,  fp);
-            fwrite(h_vC,    sizeof(double), nnzCSR,  fp);
+            if (h_rpC) {
+                fwrite(&A.rows, sizeof(int),    1,       fp);
+                fwrite(&A.cols, sizeof(int),    1,       fp);
+                fwrite(&nnzCSR, sizeof(int),    1,       fp);
+                fwrite(h_rpC,   sizeof(int),    A.rows+1,fp);
+                fwrite(h_ciC,   sizeof(int),    nnzCSR,  fp);
+                fwrite(h_vC,    sizeof(double), nnzCSR,  fp);
+            }
             fclose(fp);
         }
         free(h_tileNnzC_h); free(h_rowIdxC_h); free(h_colIdxC_h); free(h_valC_h);
