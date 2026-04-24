@@ -13,7 +13,6 @@
  */
 
 #include <cuda_runtime.h>
-#include <cusparse.h>
 #include <thrust/device_ptr.h>
 #include <thrust/scan.h>
 #include <stdio.h>
@@ -30,13 +29,6 @@
     } \
 } while(0)
 
-#define CUSPARSE_CHECK(call) do { \
-    cusparseStatus_t _s = (call); \
-    if (_s != CUSPARSE_STATUS_SUCCESS) { \
-        fprintf(stderr, "[CUSPARSE ERROR] %s:%d  code=%d\n", __FILE__, __LINE__, (int)_s); \
-        exit(EXIT_FAILURE); \
-    } \
-} while(0)
 
 static inline double wtime(void) {
     struct timeval tv; gettimeofday(&tv, NULL);
@@ -255,98 +247,105 @@ static void tiled_free(TiledMatrix *T) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
- *  STEP 1 — cuSPARSE tile-level symbolic SpGEMM
+ *  STEP 1 — Tile-level symbolic layout (paper-faithful, no cuSPARSE)
+ *
+ *  Directly implements the TileSpGEMM paper's tile-level symbolic SpGEMM:
+ *  for each tile-row i of A, collect all tile-columns j reachable via any
+ *  intermediate tile k where A(i,k) and B(k,j) both exist.  The result is
+ *  the CSR tile structure of C with entries sorted ascending per row.
+ *
+ *  Uses a per-row marker array (marker[j] == i → j already seen for row i)
+ *  to deduplicate in O(numTiles_A + numTiles_B) time without a hash set.
+ *  Works correctly for asymmetric matrices and empty rows.
  * ═══════════════════════════════════════════════════════════════════════ */
+
+/* Ascending int comparator for qsort */
+static int cmp_int_asc(const void *a, const void *b) {
+    int x = *(const int *)a, y = *(const int *)b;
+    return (x > y) - (x < y);
+}
+
 static double step1_tile_structure(const TiledMatrix *A, const TiledMatrix *B,
                                    int **h_tilePtrC_out, int **h_tileColIdxC_out,
                                    int *numTilesC_out, size_t *out_cusparse_workspace_bytes)
 {
-    cusparseHandle_t handle; CUSPARSE_CHECK(cusparseCreate(&handle));
-    
-    int rowsAp=A->tilem, colsAp=A->tilen, nnzAp=A->numTiles;
-    int rowsBp=B->tilem, colsBp=B->tilen, nnzBp=B->numTiles;
-    
-    // Allocate dummy values for cuSPARSE symbolic phase
-    double *h_vA=(double*)malloc(nnzAp*sizeof(double));
-    double *h_vB=(double*)malloc(nnzBp*sizeof(double));
-    for(int i=0;i<nnzAp;i++) h_vA[i]=1.0;
-    for(int i=0;i<nnzBp;i++) h_vB[i]=1.0;
-    
-    double *d_vA, *d_vB;
-    CUDA_CHECK(cudaMalloc(&d_vA, nnzAp*sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_vB, nnzBp*sizeof(double)));
-    CUDA_CHECK(cudaMemcpy(d_vA, h_vA, nnzAp*sizeof(double), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_vB, h_vB, nnzBp*sizeof(double), cudaMemcpyHostToDevice));
-
-    cusparseSpMatDescr_t mA, mB, mC;
-    CUSPARSE_CHECK(cusparseCreateCsr(&mA, rowsAp, colsAp, nnzAp, A->d_tilePtr, A->d_tileColIdx, d_vA, CUSPARSE_INDEX_32I, CUSPARSE_INDEX_32I, CUSPARSE_INDEX_BASE_ZERO, CUDA_R_64F));
-    CUSPARSE_CHECK(cusparseCreateCsr(&mB, rowsBp, colsBp, nnzBp, B->d_tilePtr, B->d_tileColIdx, d_vB, CUSPARSE_INDEX_32I, CUSPARSE_INDEX_32I, CUSPARSE_INDEX_BASE_ZERO, CUDA_R_64F));
-    
-    int *d_rpC; CUDA_CHECK(cudaMalloc(&d_rpC, (rowsAp+1)*sizeof(int)));
-    CUSPARSE_CHECK(cusparseCreateCsr(&mC, rowsAp, colsBp, 0, d_rpC, NULL, NULL, CUSPARSE_INDEX_32I, CUSPARSE_INDEX_32I, CUSPARSE_INDEX_BASE_ZERO, CUDA_R_64F));
-
-    double alpha=1.0, beta=0.0;
-    cusparseSpGEMMDescr_t desc; CUSPARSE_CHECK(cusparseSpGEMM_createDescr(&desc));
-
-    // -- PRE-TIMING SETUP: lightweight NULL sizing calls + workspace allocs --
-    // workEstimation(NULL): cheap query that only returns the required buffer size.
-    // workEstimation(b1):   ACTUAL WORK — cuSPARSE discovers C's tile structure here.
-    // These two calls cannot be reordered; compute(NULL) must follow workEstimation(b1)
-    // because cuSPARSE needs the structure info to size the compute workspace.
-    size_t bs1=0; void *b1=NULL;
-    CUSPARSE_CHECK(cusparseSpGEMM_workEstimation(handle, CUSPARSE_OPERATION_NON_TRANSPOSE, CUSPARSE_OPERATION_NON_TRANSPOSE, &alpha, mA, mB, &beta, mC, CUDA_R_64F, CUSPARSE_SPGEMM_DEFAULT, desc, &bs1, NULL));
-    CUDA_CHECK(cudaMalloc(&b1, bs1?bs1:1));
-
-    // Sync before starting the timer so no prior GPU work leaks in.
-    CUDA_CHECK(cudaDeviceSynchronize());
-
-    // -- START TIMER: covers both actual-work cuSPARSE calls --
     double t0 = wtime();
 
-    // Call 1: actual work estimation (finds C's nonzero structure — often the
-    // costliest part of Step 1 and was previously missing from the timer).
-    CUSPARSE_CHECK(cusparseSpGEMM_workEstimation(handle, CUSPARSE_OPERATION_NON_TRANSPOSE, CUSPARSE_OPERATION_NON_TRANSPOSE, &alpha, mA, mB, &beta, mC, CUDA_R_64F, CUSPARSE_SPGEMM_DEFAULT, desc, &bs1, b1));
+    int tilem = A->tilem;   /* tile-rows of A = tile-rows of C   */
+    int tilen = B->tilen;   /* tile-cols of B = tile-cols of C   */
 
-    // Sizing call for compute buffer (must come after workEstimation(b1)).
-    size_t bs2=0; void *b2=NULL;
-    CUSPARSE_CHECK(cusparseSpGEMM_compute(handle, CUSPARSE_OPERATION_NON_TRANSPOSE, CUSPARSE_OPERATION_NON_TRANSPOSE, &alpha, mA, mB, &beta, mC, CUDA_R_64F, CUSPARSE_SPGEMM_DEFAULT, desc, &bs2, NULL));
-    CUDA_CHECK(cudaMalloc(&b2, bs2?bs2:1));
+    /* CSR row-pointer array for C's tile structure */
+    int *h_tilePtrC = (int *)calloc(tilem + 1, sizeof(int));
+    if (!h_tilePtrC) { fprintf(stderr, "[Step1] OOM: h_tilePtrC\n"); exit(1); }
 
-    // --- BUG FIX STARTS HERE ---
-    // Extract the TRUE number of nonzeros from the last element of the row pointer array
-    int nnzC_true = 0;
-    CUDA_CHECK(cudaMemcpy(&nnzC_true, d_rpC + rowsAp, sizeof(int), cudaMemcpyDeviceToHost));
-    int64_t nnzCp = nnzC_true;
+    /* marker[j] = i means tile-col j has already been counted/recorded for
+       tile-row i in the current pass.  Initialized to -1 (never equals any
+       valid row index) so the first encounter of each j per row is detected
+       with a single comparison — no memset between rows needed. */
+    int *marker = (int *)malloc((size_t)tilen * sizeof(int));
+    if (!marker) { fprintf(stderr, "[Step1] OOM: marker\n"); exit(1); }
+    memset(marker, -1, (size_t)tilen * sizeof(int));
 
-    // Destroy the old descriptor and recreate it with the correct nnzCp
-    cusparseDestroySpMat(mC);
-    CUSPARSE_CHECK(cusparseCreateCsr(&mC, rowsAp, colsBp, nnzCp, d_rpC, NULL, NULL, CUSPARSE_INDEX_32I, CUSPARSE_INDEX_32I, CUSPARSE_INDEX_BASE_ZERO, CUDA_R_64F));
-    // --- BUG FIX ENDS HERE ---
+    /* Pass 1: count unique C tile-cols per C tile-row */
+    for (int i = 0; i < tilem; i++) {
+        for (int ap = A->h_tilePtr[i]; ap < A->h_tilePtr[i+1]; ap++) {
+            int k = A->h_tileColIdx[ap];                 /* intermediate tile-col */
+            for (int bp = B->h_tilePtr[k]; bp < B->h_tilePtr[k+1]; bp++) {
+                int j = B->h_tileColIdx[bp];             /* output tile-col       */
+                if (marker[j] != i) {
+                    marker[j] = i;
+                    h_tilePtrC[i+1]++;
+                }
+            }
+        }
+    }
 
-    int *d_ciC; double *d_vC;
-    CUDA_CHECK(cudaMalloc(&d_ciC, (size_t)nnzCp*sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&d_vC,  (size_t)nnzCp*sizeof(double)));
-    CUSPARSE_CHECK(cusparseCsrSetPointers(mC, d_rpC, d_ciC, d_vC));
+    /* Exclusive prefix-sum → CSR row pointers */
+    for (int i = 0; i < tilem; i++)
+        h_tilePtrC[i+1] += h_tilePtrC[i];
+    int numTilesC = h_tilePtrC[tilem];
 
-    *out_cusparse_workspace_bytes = bs1 + bs2; // Track peak memory overhead
+    /* Allocate column-index array (at least 1 to avoid malloc(0) corner case) */
+    int *h_tileColIdxC = (int *)malloc((size_t)(numTilesC > 0 ? numTilesC : 1) * sizeof(int));
+    if (!h_tileColIdxC) { fprintf(stderr, "[Step1] OOM: h_tileColIdxC\n"); exit(1); }
 
-    // Call 2: actual numeric/structural compute.
-    CUSPARSE_CHECK(cusparseSpGEMM_compute(handle, CUSPARSE_OPERATION_NON_TRANSPOSE, CUSPARSE_OPERATION_NON_TRANSPOSE, &alpha, mA, mB, &beta, mC, CUDA_R_64F, CUSPARSE_SPGEMM_DEFAULT, desc, &bs2, b2));
-    CUDA_CHECK(cudaDeviceSynchronize());
+    /* Reset marker for pass 2 */
+    memset(marker, -1, (size_t)tilen * sizeof(int));
+
+    /* Write cursors: one per tile-row, initialised to the row's start offset */
+    int *wp = (int *)malloc((size_t)tilem * sizeof(int));
+    if (!wp) { fprintf(stderr, "[Step1] OOM: wp\n"); exit(1); }
+    for (int i = 0; i < tilem; i++) wp[i] = h_tilePtrC[i];
+
+    /* Pass 2: fill h_tileColIdxC, then sort each row ascending.
+       Ascending order is required by the binary search in Step 2. */
+    for (int i = 0; i < tilem; i++) {
+        for (int ap = A->h_tilePtr[i]; ap < A->h_tilePtr[i+1]; ap++) {
+            int k = A->h_tileColIdx[ap];
+            for (int bp = B->h_tilePtr[k]; bp < B->h_tilePtr[k+1]; bp++) {
+                int j = B->h_tileColIdx[bp];
+                if (marker[j] != i) {
+                    marker[j] = i;
+                    h_tileColIdxC[wp[i]++] = j;
+                }
+            }
+        }
+        /* Sort tile-col indices for this row in ascending order */
+        int rs = h_tilePtrC[i];
+        int rl = h_tilePtrC[i+1] - rs;
+        if (rl > 1)
+            qsort(h_tileColIdxC + rs, rl, sizeof(int), cmp_int_asc);
+    }
+
+    free(marker);
+    free(wp);
+
     double elapsed_ms = (wtime() - t0) * 1e3;
-    // -- END TIMER --
 
-    *numTilesC_out = (int)nnzCp;
-    *h_tilePtrC_out = (int*)malloc((rowsAp+1)*sizeof(int));
-    *h_tileColIdxC_out = (int*)malloc(nnzCp*sizeof(int));
-    
-    CUDA_CHECK(cudaMemcpy(*h_tilePtrC_out, d_rpC, (rowsAp+1)*sizeof(int), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(*h_tileColIdxC_out, d_ciC, nnzCp*sizeof(int), cudaMemcpyDeviceToHost));
-
-    cusparseDestroySpMat(mA); cusparseDestroySpMat(mB); cusparseDestroySpMat(mC);
-    cusparseSpGEMM_destroyDescr(desc); cusparseDestroy(handle);
-    cudaFree(d_vA); cudaFree(d_vB); free(h_vA); free(h_vB);
-    cudaFree(b1); cudaFree(b2); cudaFree(d_rpC); cudaFree(d_ciC); cudaFree(d_vC);
+    *h_tilePtrC_out            = h_tilePtrC;
+    *h_tileColIdxC_out         = h_tileColIdxC;
+    *numTilesC_out             = numTilesC;
+    *out_cusparse_workspace_bytes = 0;   /* no cuSPARSE workspace required */
 
     return elapsed_ms;
 }
