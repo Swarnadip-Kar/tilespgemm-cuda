@@ -68,15 +68,30 @@ void csr_free(CsrMatrix *A) {
 int csr_load_binary(const char *path, CsrMatrix *A) {
     FILE *fp = fopen(path, "rb");
     if (!fp) { fprintf(stderr, "Cannot open %s\n", path); return -1; }
-    fread(&A->rows, sizeof(int), 1, fp);
-    fread(&A->cols, sizeof(int), 1, fp);
-    fread(&A->nnz,  sizeof(int), 1, fp);
+    if (fread(&A->rows, sizeof(int), 1, fp) != 1 ||
+        fread(&A->cols, sizeof(int), 1, fp) != 1 ||
+        fread(&A->nnz,  sizeof(int), 1, fp) != 1) {
+        fprintf(stderr, "Failed to read header from %s\n", path);
+        fclose(fp);
+        return -1;
+    }
     A->rowPtr = (int*)   malloc((A->rows+1)*sizeof(int));
     A->colIdx = (int*)   malloc(A->nnz*sizeof(int));
     A->val    = (double*)malloc(A->nnz*sizeof(double));
-    fread(A->rowPtr, sizeof(int),    A->rows+1, fp);
-    fread(A->colIdx, sizeof(int),    A->nnz,    fp);
-    fread(A->val,    sizeof(double), A->nnz,    fp);
+    if (!A->rowPtr || !A->colIdx || !A->val) {
+        fprintf(stderr, "Out of memory loading %s\n", path);
+        free(A->rowPtr); free(A->colIdx); free(A->val);
+        fclose(fp);
+        return -1;
+    }
+    if (fread(A->rowPtr, sizeof(int),    A->rows+1, fp) != (size_t)(A->rows+1) ||
+        fread(A->colIdx, sizeof(int),    A->nnz,    fp) != (size_t)A->nnz      ||
+        fread(A->val,    sizeof(double), A->nnz,    fp) != (size_t)A->nnz) {
+        fprintf(stderr, "Failed to read data from %s\n", path);
+        free(A->rowPtr); free(A->colIdx); free(A->val);
+        fclose(fp);
+        return -1;
+    }
     fclose(fp);
     A->d_rowPtr = NULL; A->d_colIdx = NULL; A->d_val = NULL;
     return 0;
