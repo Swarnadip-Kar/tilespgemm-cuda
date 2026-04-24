@@ -525,9 +525,10 @@ void step3_numeric_kernel(
             }
         }
         /* Barrier before the next iteration: prevents thread 0 from overwriting
-           s_posB_cur for ia+1 while other warps are still reading posB above.
-           s_posB_cur < 0 causes ALL threads to skip here via continue (same
-           condition for every thread), so there is no divergence on this barrier. */
+           s_posB_cur for ia+1 while other warps are still reading s_posB_cur
+           above (at "int posB = s_posB_cur").  When s_posB_cur < 0, ALL threads
+           hit continue (same condition for every thread), so there is no warp
+           divergence on this barrier. */
         __syncthreads();
     }
 
@@ -838,15 +839,15 @@ int main(int argc, char **argv)
                        numTilesC, TA.tilem, TA.tilen, A.rows, A.cols,
                        &h_rpC, &h_ciC, &h_vC, &nnzCSR);
         FILE *fp = fopen(save_path, "wb");
-        if (fp && h_rpC) {
-            fwrite(&A.rows, sizeof(int),    1,       fp);
-            fwrite(&A.cols, sizeof(int),    1,       fp);
-            fwrite(&nnzCSR, sizeof(int),    1,       fp);
-            fwrite(h_rpC,   sizeof(int),    A.rows+1,fp);
-            fwrite(h_ciC,   sizeof(int),    nnzCSR,  fp);
-            fwrite(h_vC,    sizeof(double), nnzCSR,  fp);
-            fclose(fp);
-        } else if (fp) {
+        if (fp) {
+            if (h_rpC) {
+                fwrite(&A.rows, sizeof(int),    1,       fp);
+                fwrite(&A.cols, sizeof(int),    1,       fp);
+                fwrite(&nnzCSR, sizeof(int),    1,       fp);
+                fwrite(h_rpC,   sizeof(int),    A.rows+1,fp);
+                fwrite(h_ciC,   sizeof(int),    nnzCSR,  fp);
+                fwrite(h_vC,    sizeof(double), nnzCSR,  fp);
+            }
             fclose(fp);
         }
         free(h_tileNnzC_h); free(h_rowIdxC_h); free(h_colIdxC_h); free(h_valC_h);
