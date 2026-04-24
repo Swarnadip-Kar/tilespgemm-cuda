@@ -685,6 +685,24 @@ int main(int argc, char **argv)
         int threads = WARPS_PER_BLOCK * WARP_SIZE;
         int blocks  = (numTilesC + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
         if (blocks < 1) blocks = 1;
+
+        /* Warm-up run (not timed) — brings kernel code and data into GPU caches */
+        step2_symbolic_kernel<<<blocks, threads>>>(
+            TA.d_tilePtr, TA.d_tileColIdx, TA.d_tileNnz,
+            TA.d_rowPtr, TA.d_mask,
+            TB.d_tilePtr, TB.d_tileColIdx, TB.d_tileNnz,
+            TB.d_rowPtr, TB.d_mask,
+            d_tileColIdxC, d_tile_row,
+            d_tileNnzC, d_rowPtrC, d_maskC,
+            numTilesC);
+        CUDA_CHECK(cudaDeviceSynchronize());
+
+        /* Reset accumulator outputs so the timed run starts from a clean slate */
+        CUDA_CHECK(cudaMemset(d_tileNnzC, 0, numTilesC*sizeof(int)));
+        CUDA_CHECK(cudaMemset(d_rowPtrC,  0, numTilesC*TILE_DIM*sizeof(unsigned char)));
+        CUDA_CHECK(cudaMemset(d_maskC,    0, numTilesC*TILE_DIM*sizeof(unsigned short)));
+
+        /* Timed run */
         CUDA_CHECK(cudaDeviceSynchronize());
         CUDA_CHECK(cudaEventRecord(ev0));
         step2_symbolic_kernel<<<blocks, threads>>>(
@@ -730,6 +748,20 @@ int main(int argc, char **argv)
     fprintf(stderr, "[TileSpGEMM] Step 3: GPU numeric (256 threads/tile) ...\n");
     {
         int blocks = (numTilesC > 0) ? numTilesC : 1;
+
+        /* Warm-up run (not timed) — step3 writes each slot exactly once so
+           running twice produces the same correct output; no reset needed. */
+        step3_numeric_kernel<<<blocks, TILE_SIZE>>>(
+            TA.d_tilePtr, TA.d_tileColIdx, TA.d_tileNnzPrefix,
+            TA.d_rowPtr,  TA.d_colIdx, TA.d_val,
+            TB.d_tilePtr, TB.d_tileColIdx, TB.d_tileNnzPrefix,
+            TB.d_rowPtr,  TB.d_colIdx, TB.d_val,
+            d_tileColIdxC, d_tileNnzPrefixC, d_rowPtrC, d_maskC, d_tile_row,
+            d_rowIdxC, d_colIdxC, d_valC,
+            numTilesC);
+        CUDA_CHECK(cudaDeviceSynchronize());
+
+        /* Timed run */
         CUDA_CHECK(cudaDeviceSynchronize());
         CUDA_CHECK(cudaEventRecord(ev0));
         step3_numeric_kernel<<<blocks, TILE_SIZE>>>(
