@@ -1,0 +1,499 @@
+% CS516/CSL516: Parallelization of Programs — Project Phase-1 Report
+% Team: Yogesh (12342420), Durgesh Nama (12340720),
+%        Arnav Mishra (12340330), Swarnadip Kar (12342210)
+% Instructor: Prof. Vishwesh Jatala, IIT Ropar
+% Submission: April 07, 2026
+
+\documentclass[conference]{IEEEtran}
+\IEEEoverridecommandlockouts
+
+%------------------------------------------------
+% PACKAGES
+%------------------------------------------------
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{cite}
+\usepackage{url}
+\usepackage[table,dvipsnames]{xcolor}
+\usepackage{booktabs}
+\usepackage{microtype}
+\usepackage{hyperref}
+\hypersetup{colorlinks=true,linkcolor=blue,citecolor=blue,urlcolor=blue}
+
+%------------------------------------------------
+\begin{document}
+
+%================================================
+% TITLE
+%================================================
+\title{Parallelizing Sparse General Matrix-Matrix Multiplication on GPUs:\\
+       TileSpGEMM vs.\ Row-Row Approach}
+
+\author{
+  \IEEEauthorblockN{%
+    Yogesh\IEEEauthorrefmark{1},\;
+    Durgesh Nama\IEEEauthorrefmark{1},\;
+    Arnav Mishra\IEEEauthorrefmark{1},\;
+    Swarnadip Kar\IEEEauthorrefmark{1}}
+  \IEEEauthorblockA{%
+    \IEEEauthorrefmark{1}Indian Institute of Technology Ropar,
+    Rupnagar, Punjab 140001, India\\
+    Roll Nos.: 12342420,\;12340720,\;12340330,\;12342210\\
+    Course: CS516/CSL516 --- Parallelization of Programs\\
+    Instructor: Prof.\ Vishwesh Jatala\quad
+    Submission: April 07, 2026}
+}
+
+\maketitle
+
+%================================================
+% ABSTRACT
+%================================================
+\begin{abstract}
+Sparse general matrix-matrix multiplication (\mbox{SpGEMM}), computing
+$C = AB$ where $A$, $B$, and $C$ are all sparse, is a fundamental
+building block in algebraic multigrid solvers, graph analytics, and
+pruned deep neural networks.
+Existing GPU implementations primarily use Gustavson's \emph{row-row}
+algorithm --- as exposed by NVIDIA cuSPARSE --- which suffers from three
+well-known performance bottlenecks: (i)~load imbalance across rows of
+unequal length, (ii)~large global-memory allocation for intermediate
+products, and (iii)~complex sparse-accumulator design.
+In this project we implement and evaluate \emph{TileSpGEMM}~\cite{tilespgemm},
+a tiled parallel SpGEMM that uses fixed-size $16\!\times\!16$ sparse tiles
+as the basic work unit, resolving all three issues by keeping intermediate
+data entirely in on-chip shared memory.
+We benchmark both approaches on six matrices from the SuiteSparse
+Matrix Collection~\cite{suitesparse}, comparing GFlops throughput,
+peak memory usage, per-phase runtime breakdown, format-conversion
+overhead, and storage efficiency.
+\end{abstract}
+
+%================================================
+% 1. INTRODUCTION
+%================================================
+\section{Introduction}
+
+SpGEMM --- computing $C = AB$ with all matrices sparse --- is one of the
+most critical kernels in high-performance scientific computing.
+It appears at the heart of algebraic multigrid (AMG)
+preconditioners~\cite{tilespgemm}, breadth-first search and triangle
+counting in graph analytics, Markov clustering in bioinformatics, and
+sparse neural-network inference after weight pruning.
+Because the sparsity pattern of $C$ is unknown in advance, and all three
+operands are sparse, parallelising SpGEMM is substantially harder than
+sparse matrix-vector multiplication (SpMV).
+
+\subsection*{Limitations of Existing Solutions}
+
+The dominant parallel SpGEMM approach on GPUs follows
+\emph{Gustavson's row-row algorithm}~\cite{tilespgemm}: each thread block
+or warp independently computes a row of $C$ by merging scaled rows of $B$
+indexed by non-zeros of $A$.
+Despite good intra-row parallelism, three performance issues persist:
+
+\begin{enumerate}
+\item \textbf{Load imbalance.}  Row lengths in real-world sparse
+  matrices span orders of magnitude (e.g., in \texttt{webbase-1M} three
+  rows require $>$100K FLOPs while 999{,}812 rows need fewer than 100).
+  A handful of long rows dominate total runtime.
+\item \textbf{Excessive global-memory pressure.}  The size of $C$ is
+  unknown before computation; implementations must speculatively allocate
+  large buffers for intermediate products, stressing device memory
+  bandwidth and capacity.
+\item \textbf{Sparse-accumulator complexity.}  Inserting products into
+  random column positions within a row requires an efficient sparse
+  accumulator (hash table, heap, or dense row), each with significant
+  overhead at scale.
+\end{enumerate}
+
+Vendor-provided cuSPARSE v11/12 implements the row-row paradigm with
+careful binning and two-pass (symbolic + numeric) execution, yet it still
+exhibits the above limitations for irregular matrices.
+
+\subsection*{Key Contributions}
+
+In this project we:
+\begin{enumerate}
+\item \textbf{Implement RowSpGEMM} as a thin, instrumented wrapper around
+  \texttt{cusparseSpGEMM}, recording per-run GFlops, peak memory, and
+  wall-clock time.
+\item \textbf{Implement TileSpGEMM} from scratch in CUDA C++, faithfully
+  following the three-step tiled algorithm of Niu et al.~\cite{tilespgemm}:
+  tile-structure discovery (Step~1), symbolic bitmask phase (Step~2), and
+  adaptive numeric phase (Step~3).
+\item \textbf{Build an automated benchmark harness} that extracts
+  \texttt{.tar.gz} archives, converts MTX files to binary CSR, runs both
+  algorithms, and produces five publication-quality figures.
+\end{enumerate}
+
+%================================================
+% 2. APPROACH
+%================================================
+\section{Approach}
+
+\subsection{Sparse Tile Data Structure}
+
+TileSpGEMM represents each sparse matrix as a two-level tiled format
+with a fixed tile size of $T = 16$.
+
+\textbf{Upper level (tile structure).}
+Three arrays describe which tiles are non-empty:
+\texttt{tilePtr}[$\lceil m/T \rceil + 1$] stores tile-row offsets;
+\texttt{tileColIdx}[$N_t$] stores tile column indices; and
+\texttt{tileNnz}[$N_t$] stores the nonzero count per tile, where $N_t$
+is the total number of non-empty tiles.
+
+\textbf{Lower level (per-tile data).}
+Each tile stores its nonzeros in CSR style using \emph{compact}
+data types to maximise shared-memory utilisation:
+(i)~\texttt{rowPtr}[$N_t \cdot 16$] as \texttt{uint8} (16 row-pointer
+entries per tile, values $\in[0,255]$);
+(ii)~\texttt{rowIdx}, \texttt{colIdx} as \texttt{uint8} packing 4-bit
+local indices;
+(iii)~\texttt{val} as \texttt{float64}; and
+(iv)~\texttt{mask}[$N_t \cdot 16$] as \texttt{uint16} bitmasks (one bit
+per column position in each tile row).
+The tile size $T=16$ is chosen to fully exploit 8-bit and 16-bit types.
+Compared with standard CSR, the tiled format typically uses
+\emph{fewer bytes} due to 4-bit local indices replacing 32-bit global
+ones, while the extra bitmask arrays enable fast symbolic computation.
+
+\subsection{Three-Step TileSpGEMM Algorithm}
+
+\textbf{Step~1 --- Tile structure of $C$ (symbolic tile-level SpGEMM).}
+The high-level tile layout of $A$ and $B$, denoted $A'$ and $B'$, are
+themselves sparse matrices of size $\lceil m/T\rceil \times \lceil n/T\rceil$
+whose nonzeros represent non-empty tiles.
+We invoke \texttt{cusparseSpGEMM} on $A'$ and $B'$ to obtain $C' = A'B'$;
+the sparsity pattern of $C'$ gives the tile structure of $C$.
+Because tile counts are much smaller than per-element nonzero counts,
+Step~1 consistently takes $<5\%$ of total runtime.
+
+\textbf{Step~2 --- Symbolic phase (bitmask generation).}
+For each output tile $C_{ij}$, a GPU warp (32 threads) performs a
+\emph{binary-search set intersection} on
+\texttt{tileColIdx}\textsubscript{$A$}[row~$i$] and
+\texttt{tileRowIdx}\textsubscript{$B$}[col~$j$] to find matched tile pairs
+$(A_{ik}, B_{kj})$.
+For each matched pair, the warp traverses non-zeros of $A_{ik}$: the
+column index of each non-zero selects a row from $B_{kj}$'s bitmask, and
+\texttt{AtomicOr} accumulates it into $C_{ij}$'s bitmask.
+When all rows are processed, the bitmask encodes the exact sparsity
+structure of $C_{ij}$; \texttt{popcount} over bitmask rows gives $\text{nnz}$
+and a prefix scan gives \texttt{rowPtr} --- all without any global-memory
+allocation.
+
+\textbf{Step~3 --- Numeric phase (adaptive accumulator).}
+After memory for $C$ is allocated using the nnz counts from Step~2,
+each warp computes values for one output tile.
+An \emph{adaptive threshold} $\tau = 192$ (75\% of $T^2 = 256$) selects
+the accumulator:
+if $\text{nnz}(C_{ij}) \geq \tau$, a \emph{dense} $16\!\times\!16$ shared-memory
+accumulator accumulates products directly at $(r, c)$ positions and then
+is compressed using the known bitmask;
+otherwise a \emph{sparse} accumulator indexed by column position is used.
+Products are computed tile-wise: for each matched pair $(A_{ik}, B_{kj})$,
+non-zeros of $A_{ik}$ are iterated and for each entry $(r_a, c_a, v_a)$,
+the CSR row $c_a$ of $B_{kj}$ is loaded and each entry $(c_b, v_b)$
+contributes $v_a \cdot v_b$ to $C_{ij}[r_a][c_b]$.
+All intermediate data fit within shared memory; no global temporary
+buffers are required.
+
+\subsection{Implementation Details}
+
+Both algorithms are implemented in CUDA C++ and compiled with
+\texttt{nvcc -O3 -arch=\$(GPU\_ARCH)}, where the architecture is
+auto-detected from \texttt{nvidia-smi}.
+The RowSpGEMM binary wraps the three-API cuSPARSE flow:
+\texttt{workEstimation} $\to$ \texttt{compute} $\to$ \texttt{copy}.
+The TileSpGEMM binary performs CSR$\to$tiled conversion on the host,
+uploads tile arrays to device, runs Steps~1--2 on GPU, and runs Step~3
+on CPU for numerical correctness.
+Timing is measured with \texttt{cudaEvent} for GPU kernels and
+\texttt{gettimeofday} for host phases; results are emitted as JSON for
+downstream plotting.
+
+%================================================
+% 3. EVALUATION METHODOLOGY
+%================================================
+\section{Evaluation Methodology}
+
+\subsection{Hardware and Software Platform}
+
+Experiments run on a single node equipped with an
+\textbf{NVIDIA Ada Lovelace GPU} (compute capability \texttt{sm\_89},
+confirmed via \texttt{nvidia-smi}), installed alongside an Intel x86-64
+CPU running Ubuntu 22.04.
+The CUDA toolkit version is 12.0 (driver 470+); cuSPARSE v12 is used for
+RowSpGEMM and for Step~1 of TileSpGEMM.
+Python 3.12 with SciPy, NumPy, and Matplotlib is used for MTX parsing
+and graph generation.
+
+\subsection{Input Datasets}
+
+We benchmark on \textbf{six sparse square matrices} drawn from the
+SuiteSparse Matrix Collection~\cite{suitesparse} (formerly UFMC):
+\texttt{1138\_bus} ($n=1138$, nnz$=4054$),
+\texttt{bcspwr06} ($n=1454$, nnz$=5300$),
+\texttt{bcspwr07} ($n=1612$, nnz$=5765$),
+\texttt{bcspwr08} ($n=1624$, nnz$=6710$),
+\texttt{bcspwr09} ($n=1723$, nnz$=8677$), and
+\texttt{bcsstk13} ($n=2003$, nnz$=83883$).
+Each matrix is converted from Matrix Market format to a binary CSR file
+using SciPy's \texttt{mmread} (handles symmetric expansion).
+The operation timed is $C = A^2$.
+
+\subsection{Metrics and Comparison}
+
+We compare RowSpGEMM (cuSPARSE) against TileSpGEMM across five metrics,
+visualised in five output figures:
+\begin{enumerate}
+\item \textbf{GFlops throughput} per matrix (Fig.~1, cf.\ Fig.~7 of~\cite{tilespgemm}).
+\item \textbf{Peak device memory} in MB (Fig.~2, cf.\ Fig.~9).
+\item \textbf{Runtime breakdown} of TileSpGEMM into Step~1, Step~2, Step~3 (Fig.~3, cf.\ Fig.~10).
+\item \textbf{Format conversion time} vs.\ single SpGEMM runtime on a
+  log-log scatter plot (Fig.~4, cf.\ Fig.~12).
+\item \textbf{Storage cost} of CSR vs.\ tiled format in MB (Fig.~5,
+  cf.\ Fig.~11).
+\end{enumerate}
+Correctness is verified by comparing the nnz of $C$ produced by both
+algorithms; any discrepancy due to TileSpGEMM retaining
+\emph{structurally zero} tiles is flagged and explained.
+
+%================================================
+% REFERENCES
+%================================================
+\begin{thebibliography}{9}
+
+\bibitem{tilespgemm}
+Y.\ Niu, Z.\ Lu, H.\ Ji, S.\ Song, Z.\ Jin, and W.\ Liu,
+``TileSpGEMM: A tiled algorithm for parallel sparse general matrix-matrix
+multiplication on GPUs,''
+in \textit{Proc.\ 27th ACM SIGPLAN Symp.\ Principles and Practice of
+Parallel Programming (PPoPP)}, Seoul, Republic of Korea, Apr.\ 2022,
+pp.\ 90--106.
+\url{https://doi.org/10.1145/3503221.3508431}
+
+\bibitem{suitesparse}
+T.\ A.\ Davis and Y.\ Hu,
+``The University of Florida Sparse Matrix Collection,''
+\textit{ACM Trans.\ Math.\ Softw.}, vol.\ 38, no.\ 1, pp.\ 1:1--1:25,
+Dec.\ 2011.
+
+\bibitem{cusparse}
+NVIDIA Corporation,
+``cuSPARSE Library,'' CUDA Toolkit Documentation v12.0, 2023.
+[Online]. Available: \url{https://docs.nvidia.com/cuda/cusparse}
+
+\bibitem{gustavson}
+F.\ G.\ Gustavson,
+``Two fast algorithms for sparse matrices: Multiplication and permuted
+transposition,''
+\textit{ACM Trans.\ Math.\ Softw.}, vol.\ 4, no.\ 3, pp.\ 250--269, 1978.
+
+\bibitem{nsparse}
+Y.\ Nagasaka, S.\ Matsuoka, A.\ Azad, and A.\ Bulu\c{c},
+``Performance optimization, modeling and analysis of sparse
+matrix-matrix products on multi-core and many-core processors,''
+\textit{Parallel Comput.}, vol.\ 90, 2019.
+
+\end{thebibliography}  random column positions within a row requires an efficient sparse
+  accumulator (hash table, heap, or dense row), each with significant
+  overhead at scale.
+\end{enumerate}
+
+Vendor-provided cuSPARSE v11/12 implements the row-row paradigm with
+careful binning and two-pass (symbolic + numeric) execution, yet it still
+exhibits the above limitations for irregular matrices.
+
+\subsection*{Key Contributions}
+
+In this project we:
+\begin{enumerate}
+\item \textbf{Implement RowSpGEMM} as a thin, instrumented wrapper around
+  \texttt{cusparseSpGEMM}, recording per-run GFlops, peak memory, and
+  wall-clock time.
+\item \textbf{Implement TileSpGEMM} from scratch in CUDA C++, faithfully
+  following the three-step tiled algorithm of Niu et al.~\cite{tilespgemm}:
+  tile-structure discovery (Step~1), symbolic bitmask phase (Step~2), and
+  adaptive numeric phase (Step~3).
+\item \textbf{Build an automated benchmark harness} that extracts
+  \texttt{.tar.gz} archives, converts MTX files to binary CSR, runs both
+  algorithms, and produces five publication-quality figures.
+\end{enumerate}
+
+%================================================
+% 2. APPROACH
+%================================================
+\section{Approach}
+
+\subsection{Sparse Tile Data Structure}
+
+TileSpGEMM represents each sparse matrix as a two-level tiled format
+with a fixed tile size of $T = 16$.
+
+\textbf{Upper level (tile structure).}
+Three arrays describe which tiles are non-empty:
+\texttt{tilePtr}[$\lceil m/T \rceil + 1$] stores tile-row offsets;
+\texttt{tileColIdx}[$N_t$] stores tile column indices; and
+\texttt{tileNnz}[$N_t$] stores the nonzero count per tile, where $N_t$
+is the total number of non-empty tiles.
+
+\textbf{Lower level (per-tile data).}
+Each tile stores its nonzeros in CSR style using \emph{compact}
+data types to maximise shared-memory utilisation:
+(i)~\texttt{rowPtr}[$N_t \cdot 16$] as \texttt{uint8} (16 row-pointer
+entries per tile, values $\in[0,255]$);
+(ii)~\texttt{rowIdx}, \texttt{colIdx} as \texttt{uint8} packing 4-bit
+local indices;
+(iii)~\texttt{val} as \texttt{float64}; and
+(iv)~\texttt{mask}[$N_t \cdot 16$] as \texttt{uint16} bitmasks (one bit
+per column position in each tile row).
+The tile size $T=16$ is chosen to fully exploit 8-bit and 16-bit types.
+Compared with standard CSR, the tiled format typically uses
+\emph{fewer bytes} due to 4-bit local indices replacing 32-bit global
+ones, while the extra bitmask arrays enable fast symbolic computation.
+
+\subsection{Three-Step TileSpGEMM Algorithm}
+
+\textbf{Step~1 --- Tile structure of $C$ (symbolic tile-level SpGEMM).}
+The high-level tile layout of $A$ and $B$, denoted $A'$ and $B'$, are
+themselves sparse matrices of size $\lceil m/T\rceil \times \lceil n/T\rceil$
+whose nonzeros represent non-empty tiles.
+We invoke \texttt{cusparseSpGEMM} on $A'$ and $B'$ to obtain $C' = A'B'$;
+the sparsity pattern of $C'$ gives the tile structure of $C$.
+Because tile counts are much smaller than per-element nonzero counts,
+Step~1 consistently takes $<5\%$ of total runtime.
+
+\textbf{Step~2 --- Symbolic phase (bitmask generation).}
+For each output tile $C_{ij}$, a GPU warp (32 threads) performs a
+\emph{binary-search set intersection} on
+\texttt{tileColIdx}\textsubscript{$A$}[row~$i$] and
+\texttt{tileRowIdx}\textsubscript{$B$}[col~$j$] to find matched tile pairs
+$(A_{ik}, B_{kj})$.
+For each matched pair, the warp traverses non-zeros of $A_{ik}$: the
+column index of each non-zero selects a row from $B_{kj}$'s bitmask, and
+\texttt{AtomicOr} accumulates it into $C_{ij}$'s bitmask.
+When all rows are processed, the bitmask encodes the exact sparsity
+structure of $C_{ij}$; \texttt{popcount} over bitmask rows gives $\text{nnz}$
+and a prefix scan gives \texttt{rowPtr} --- all without any global-memory
+allocation.
+
+\textbf{Step~3 --- Numeric phase (adaptive accumulator).}
+After memory for $C$ is allocated using the nnz counts from Step~2,
+each warp computes values for one output tile.
+An \emph{adaptive threshold} $\tau = 192$ (75\% of $T^2 = 256$) selects
+the accumulator:
+if $\text{nnz}(C_{ij}) \geq \tau$, a \emph{dense} $16\!\times\!16$ shared-memory
+accumulator accumulates products directly at $(r, c)$ positions and then
+is compressed using the known bitmask;
+otherwise a \emph{sparse} accumulator indexed by column position is used.
+Products are computed tile-wise: for each matched pair $(A_{ik}, B_{kj})$,
+non-zeros of $A_{ik}$ are iterated and for each entry $(r_a, c_a, v_a)$,
+the CSR row $c_a$ of $B_{kj}$ is loaded and each entry $(c_b, v_b)$
+contributes $v_a \cdot v_b$ to $C_{ij}[r_a][c_b]$.
+All intermediate data fit within shared memory; no global temporary
+buffers are required.
+
+\subsection{Implementation Details}
+
+Both algorithms are implemented in CUDA C++ and compiled with
+\texttt{nvcc -O3 -arch=\$(GPU\_ARCH)}, where the architecture is
+auto-detected from \texttt{nvidia-smi}.
+The RowSpGEMM binary wraps the three-API cuSPARSE flow:
+\texttt{workEstimation} $\to$ \texttt{compute} $\to$ \texttt{copy}.
+The TileSpGEMM binary performs CSR$\to$tiled conversion on the host,
+uploads tile arrays to device, runs Steps~1--2 on GPU, and runs Step~3
+on CPU for numerical correctness.
+Timing is measured with \texttt{cudaEvent} for GPU kernels and
+\texttt{gettimeofday} for host phases; results are emitted as JSON for
+downstream plotting.
+
+%================================================
+% 3. EVALUATION METHODOLOGY
+%================================================
+\section{Evaluation Methodology}
+
+\subsection{Hardware and Software Platform}
+
+Experiments run on a single node equipped with an
+\textbf{NVIDIA Ada Lovelace GPU} (compute capability \texttt{sm\_89},
+confirmed via \texttt{nvidia-smi}), installed alongside an Intel x86-64
+CPU running Ubuntu 22.04.
+The CUDA toolkit version is 12.0 (driver 470+); cuSPARSE v12 is used for
+RowSpGEMM and for Step~1 of TileSpGEMM.
+Python 3.12 with SciPy, NumPy, and Matplotlib is used for MTX parsing
+and graph generation.
+
+\subsection{Input Datasets}
+
+We benchmark on \textbf{six sparse square matrices} drawn from the
+SuiteSparse Matrix Collection~\cite{suitesparse} (formerly UFMC):
+\texttt{1138\_bus} ($n=1138$, nnz$=4054$),
+\texttt{bcspwr06} ($n=1454$, nnz$=5300$),
+\texttt{bcspwr07} ($n=1612$, nnz$=5765$),
+\texttt{bcspwr08} ($n=1624$, nnz$=6710$),
+\texttt{bcspwr09} ($n=1723$, nnz$=8677$), and
+\texttt{bcsstk13} ($n=2003$, nnz$=83883$).
+Each matrix is converted from Matrix Market format to a binary CSR file
+using SciPy's \texttt{mmread} (handles symmetric expansion).
+The operation timed is $C = A^2$.
+
+\subsection{Metrics and Comparison}
+
+We compare RowSpGEMM (cuSPARSE) against TileSpGEMM across five metrics,
+visualised in five output figures:
+\begin{enumerate}
+\item \textbf{GFlops throughput} per matrix (Fig.~1, cf.\ Fig.~7 of~\cite{tilespgemm}).
+\item \textbf{Peak device memory} in MB (Fig.~2, cf.\ Fig.~9).
+\item \textbf{Runtime breakdown} of TileSpGEMM into Step~1, Step~2, Step~3 (Fig.~3, cf.\ Fig.~10).
+\item \textbf{Format conversion time} vs.\ single SpGEMM runtime on a
+  log-log scatter plot (Fig.~4, cf.\ Fig.~12).
+\item \textbf{Storage cost} of CSR vs.\ tiled format in MB (Fig.~5,
+  cf.\ Fig.~11).
+\end{enumerate}
+Correctness is verified by comparing the nnz of $C$ produced by both
+algorithms; any discrepancy due to TileSpGEMM retaining
+\emph{structurally zero} tiles is flagged and explained.
+
+%================================================
+% REFERENCES
+%================================================
+\begin{thebibliography}{9}
+
+\bibitem{tilespgemm}
+Y.\ Niu, Z.\ Lu, H.\ Ji, S.\ Song, Z.\ Jin, and W.\ Liu,
+``TileSpGEMM: A tiled algorithm for parallel sparse general matrix-matrix
+multiplication on GPUs,''
+in \textit{Proc.\ 27th ACM SIGPLAN Symp.\ Principles and Practice of
+Parallel Programming (PPoPP)}, Seoul, Republic of Korea, Apr.\ 2022,
+pp.\ 90--106.
+\url{https://doi.org/10.1145/3503221.3508431}
+
+\bibitem{suitesparse}
+T.\ A.\ Davis and Y.\ Hu,
+``The University of Florida Sparse Matrix Collection,''
+\textit{ACM Trans.\ Math.\ Softw.}, vol.\ 38, no.\ 1, pp.\ 1:1--1:25,
+Dec.\ 2011.
+
+\bibitem{cusparse}
+NVIDIA Corporation,
+``cuSPARSE Library,'' CUDA Toolkit Documentation v12.0, 2023.
+[Online]. Available: \url{https://docs.nvidia.com/cuda/cusparse}
+
+\bibitem{gustavson}
+F.\ G.\ Gustavson,
+``Two fast algorithms for sparse matrices: Multiplication and permuted
+transposition,''
+\textit{ACM Trans.\ Math.\ Softw.}, vol.\ 4, no.\ 3, pp.\ 250--269, 1978.
+
+\bibitem{nsparse}
+Y.\ Nagasaka, S.\ Matsuoka, A.\ Azad, and A.\ Bulu\c{c},
+``Performance optimization, modeling and analysis of sparse
+matrix-matrix products on multi-core and many-core processors,''
+\textit{Parallel Comput.}, vol.\ 90, 2019.
+
+\end{thebibliography}
+
+\end{document}

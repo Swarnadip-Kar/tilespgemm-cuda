@@ -1,0 +1,1277 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TileSpGEMM — Interactive Algorithm Demo</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#0d1117;color:#e6edf3;font-family:'Segoe UI',system-ui,sans-serif;
+     display:flex;flex-direction:column;height:100vh;overflow:hidden}
+
+/* ── Header ─────────────────────────────────────────────────────── */
+#hdr{background:#161b22;border-bottom:2px solid #21262d;padding:10px 20px;
+     display:flex;align-items:center;gap:14px;flex-shrink:0}
+#hdr h1{font-size:1.25em;color:#58a6ff;letter-spacing:-.3px}
+#hdr h1 span{color:#3fb950}
+.badge{background:#1f6feb22;border:1px solid #1f6feb55;border-radius:20px;
+       padding:3px 12px;font-size:.75em;color:#58a6ff}
+#step-info{margin-left:auto;font-size:.8em;color:#6e7681}
+
+/* ── Layout ─────────────────────────────────────────────────────── */
+#main{display:flex;flex:1;overflow:hidden;min-height:0}
+
+/* ── Left sidebar ─────────────────────────────────────────────── */
+#sidebar{width:280px;background:#161b22;border-right:1px solid #21262d;
+         display:flex;flex-direction:column;flex-shrink:0;overflow:hidden}
+#step-num{padding:14px 16px 4px;font-size:.7em;color:#3fb950;font-weight:700;
+          text-transform:uppercase;letter-spacing:.1em}
+#step-title{padding:0 16px 10px;font-size:1.05em;font-weight:700;color:#f0f6fc;
+            line-height:1.3}
+#step-body{padding:0 16px;font-size:.82em;color:#8b949e;line-height:1.65;
+           flex-shrink:0}
+#step-body strong{color:#c9d1d9}
+
+/* pseudocode panel */
+#pseudo{margin:12px 12px 0;background:#0d1117;border:1px solid #30363d;
+        border-radius:6px;padding:10px;font-family:'Cascadia Code','Consolas',monospace;
+        font-size:.72em;line-height:1.7;overflow-y:auto;flex:1}
+.pl{color:#6e7681;padding:0 4px;border-radius:3px;cursor:default;
+    transition:background .25s,color .25s;white-space:pre}
+.pl.hi{background:#264f7888;color:#e6edf3;border-left:2px solid #58a6ff}
+.pl.done{color:#3fb950}
+.kw{color:#ff7b72}.fn{color:#d2a8ff}.cm{color:#6e7681;font-style:italic}
+.num{color:#79c0ff}.str{color:#a5d6ff}
+
+/* ── Canvas area ─────────────────────────────────────────────── */
+#cvwrap{flex:1;display:flex;align-items:center;justify-content:center;
+        background:#0d1117;position:relative;overflow:hidden}
+canvas{display:block}
+
+/* ── Right panel ─────────────────────────────────────────────── */
+#rpanel{width:230px;background:#161b22;border-left:1px solid #21262d;
+        padding:14px;overflow-y:auto;display:flex;flex-direction:column;gap:10px;
+        flex-shrink:0}
+.card{background:#0d1117;border:1px solid #30363d;border-radius:8px;padding:12px}
+.card h4{font-size:.7em;color:#58a6ff;text-transform:uppercase;
+         letter-spacing:.08em;margin-bottom:8px}
+.kv{display:flex;justify-content:space-between;padding:3px 0;
+    border-bottom:1px solid #1c2128;font-size:.75em}
+.kv:last-child{border:none}
+.kv span:first-child{color:#6e7681}
+.kv span:last-child{color:#e6edf3;font-weight:600}
+.legend-row{display:flex;align-items:center;gap:7px;font-size:.75em;
+            color:#8b949e;margin:3px 0}
+.swatch{width:14px;height:14px;border-radius:3px;flex-shrink:0}
+
+/* ── Controls ─────────────────────────────────────────────────── */
+#ctrl{background:#161b22;border-top:2px solid #21262d;padding:10px 20px;
+      display:flex;align-items:center;gap:12px;flex-shrink:0}
+.btn{background:#21262d;border:1px solid #30363d;color:#e6edf3;
+     padding:7px 16px;border-radius:6px;cursor:pointer;font-size:.88em;
+     transition:all .18s;user-select:none}
+.btn:hover{background:#30363d;border-color:#58a6ff;color:#58a6ff}
+.btn:disabled{opacity:.35;cursor:default;pointer-events:none}
+.btn.pri{background:#1f6feb;border-color:#1f6feb;color:#fff}
+.btn.pri:hover{background:#388bfd}
+#dots{display:flex;gap:5px;flex-wrap:wrap}
+.dot{width:10px;height:10px;border-radius:50%;background:#21262d;
+     border:1px solid #30363d;cursor:pointer;transition:all .2s}
+.dot.cur{background:#58a6ff;border-color:#58a6ff;transform:scale(1.3)}
+.dot.done{background:#3fb95066;border-color:#3fb950}
+#spd-wrap{display:flex;align-items:center;gap:6px;margin-left:auto;
+          font-size:.78em;color:#6e7681}
+input[type=range]{accent-color:#58a6ff;width:80px}
+#prog-wrap{width:100%;height:3px;background:#21262d;border-radius:2px;
+           overflow:hidden;margin-top:2px}
+#prog{height:100%;background:linear-gradient(90deg,#1f6feb,#58a6ff);
+      transition:width .4s ease;border-radius:2px}
+</style>
+</head>
+<body>
+
+<!-- ═══ Header ═══ -->
+<div id="hdr">
+  <h1>Tile<span>SpGEMM</span> — Interactive Algorithm Demo</h1>
+  <div class="badge">PPoPP '22</div>
+  <div id="step-info">Step <span id="sn">1</span> / 9</div>
+</div>
+
+<!-- ═══ Main layout ═══ -->
+<div id="main">
+
+  <!-- Left sidebar -->
+  <div id="sidebar">
+    <div id="step-num">Step 0</div>
+    <div id="step-title">Loading…</div>
+    <div id="step-body"></div>
+    <div id="pseudo"></div>
+  </div>
+
+  <!-- Canvas -->
+  <div id="cvwrap">
+    <canvas id="cv"></canvas>
+    <div id="prog-wrap" style="position:absolute;bottom:0;left:0;right:0"><div id="prog"></div></div>
+  </div>
+
+  <!-- Right panel -->
+  <div id="rpanel">
+    <div class="card" id="statsCard">
+      <h4>Matrix Stats</h4>
+      <div class="kv"><span>Rows / Cols</span><span>8 × 8</span></div>
+      <div class="kv"><span>NNZ(A)</span><span>12</span></div>
+      <div class="kv"><span>Tile size</span><span>4 × 4</span></div>
+      <div class="kv"><span>Tile grid</span><span>2 × 2</span></div>
+      <div class="kv"><span>Non-empty tiles</span><span>3 / 4</span></div>
+    </div>
+    <div class="card" id="legendCard">
+      <h4>Legend</h4>
+      <div class="legend-row"><div class="swatch" style="background:#1f6feb"></div>Tile (0,0) — top-left</div>
+      <div class="legend-row"><div class="swatch" style="background:#bc4c00"></div>Tile (0,1) — top-right</div>
+      <div class="legend-row"><div class="swatch" style="background:#388bfd44;border:1px dashed #388bfd"></div>Tile (1,0) — empty</div>
+      <div class="legend-row"><div class="swatch" style="background:#8957e5"></div>Tile (1,1) — bot-right</div>
+    </div>
+    <div class="card" id="extraCard"><h4>Current Focus</h4><div id="extraBody" style="font-size:.78em;color:#8b949e;line-height:1.6">—</div></div>
+  </div>
+</div>
+
+<!-- ═══ Controls ═══ -->
+<div id="ctrl">
+  <button class="btn" id="btnPrev" onclick="navigate(-1)">◀ Prev</button>
+  <button class="btn pri" id="btnPlay" onclick="togglePlay()">▶ Play</button>
+  <button class="btn" id="btnNext" onclick="navigate(1)">Next ▶</button>
+  <div id="dots"></div>
+  <div id="spd-wrap">
+    Speed <input type="range" id="spd" min="0.3" max="3" step="0.1" value="1">
+    <span id="spdVal">1×</span>
+  </div>
+</div>
+
+<script>
+/* ═══════════════════════════════════════════════════════════════════
+   DATA — 8×8 sparse matrix  (B = A,  computing C = A²)
+═══════════════════════════════════════════════════════════════════ */
+const A = [
+  [2, 0, 1, 0,   0, 0, 0, 0],  // row 0
+  [0, 3, 0, 0,   1, 0, 0, 0],  // row 1
+  [0, 0, 0, 0,   0, 0, 0, 0],  // row 2  (empty)
+  [1, 0, 2, 0,   0, 0, 0, 0],  // row 3
+  [0, 0, 0, 0,   4, 0, 0, 0],  // row 4
+  [0, 0, 0, 0,   0, 0, 2, 0],  // row 5
+  [0, 0, 0, 0,   1, 0, 0, 3],  // row 6
+  [0, 0, 0, 0,   0, 0, 0, 0],  // row 7  (empty)
+];
+const N = 8, T = 4; // matrix size, tile size
+
+// Tile contents (4×4 sub-matrices)
+const TILES = {
+  '00': {r:0,c:0, data:[[2,0,1,0],[0,3,0,0],[0,0,0,0],[1,0,2,0]], nnz:5,
+         mask:[0b0101,0b0010,0b0000,0b0101]},
+  '01': {r:0,c:1, data:[[0,0,0,0],[1,0,0,0],[0,0,0,0],[0,0,0,0]], nnz:1,
+         mask:[0b0000,0b0001,0b0000,0b0000]},
+  '10': {r:1,c:0, data:[[0,0,0,0],[0,0,0,0],[0,0,0,0],[0,0,0,0]], nnz:0,
+         mask:[0,0,0,0]},
+  '11': {r:1,c:1, data:[[4,0,0,0],[0,0,2,0],[1,0,0,3],[0,0,0,0]], nnz:5,
+         mask:[0b0001,0b0100,0b1001,0b0000]},
+};
+
+// C tile structure (from symbolic C'=A'B')
+const C_TILES = ['00','01','11'];
+
+// C values  (verified by hand / run)
+const C_computed = Array.from({length:8},()=>Array(8).fill(0));
+for(let i=0;i<8;i++) for(let k=0;k<8;k++) if(A[i][k])
+  for(let j=0;j<8;j++) if(A[k][j]) C_computed[i][j]+=A[i][k]*A[k][j];
+
+/* ── Tile color palette ───────────────────────────────────────── */
+const TC = {
+  '00': {fill:'#1f3a6e', stroke:'#58a6ff', bright:'#388bfd', label:'T(0,0)'},
+  '01': {fill:'#4a1a00', stroke:'#f78166', bright:'#ff7b72', label:'T(0,1)'},
+  '10': {fill:'#1c2128', stroke:'#30363d', bright:'#6e7681', label:'T(1,0) empty'},
+  '11': {fill:'#2d1b69', stroke:'#a371f7', bright:'#d2a8ff', label:'T(1,1)'},
+};
+const NZ_CLR  = '#3fb950';   // nonzero cell fill
+const ZERO_CLR= '#1c2128';   // zero cell fill
+const HL_CLR  = '#f0f6fc';   // highlighted text
+
+/* ═══════════════════════════════════════════════════════════════════
+   STEPS definition
+═══════════════════════════════════════════════════════════════════ */
+const STEPS = [
+  // 0 ── Introduction ──────────────────────────────────────────
+  {tag:'01', title:'The SpGEMM Problem',
+   body:`<strong>Sparse General Matrix-Matrix Multiplication</strong> computes
+<strong>C = A × B</strong> where <em>all three matrices are sparse</em>.
+
+It is a core kernel in:
+• Algebraic multigrid solvers
+• Graph analytics (BFS, triangle counting)
+• Machine learning (pruned DNNs)
+
+Because the sparsity of C is unknown, parallelising SpGEMM
+is fundamentally harder than SpMV.`,
+   hi:[0], dur:4000,
+   extra:`<b>Goal:</b> Compute C = A² efficiently on GPU with both algorithms and compare.<br><br>
+<b>A matrix:</b> 8×8, 12 non-zeros<br>
+<b>Density:</b> 18.75%`,
+   draw: drawIntro},
+
+  // 1 ── Row-Row issues ────────────────────────────────────────
+  {tag:'02', title:'Row-Row Approach & Its Problems',
+   body:`The dominant GPU method (cuSPARSE / Gustavson):
+<em>Each thread-block computes one row of C by merging scaled rows of B.</em>
+
+Three critical performance issues:
+① <strong>Load imbalance</strong> — row lengths vary wildly; few long rows dominate.
+② <strong>Global memory pressure</strong> — size of C is unknown; large temporary buffers needed.
+③ <strong>Sparse accumulator complexity</strong> — inserting products at random column positions.`,
+   hi:[1,2,3,4], dur:5000,
+   extra:`Row-by-row: easy to parallelise but fundamentally limited by irregular structure.
+
+In power-law graphs (e.g. webbase-1M):
+• 3 rows need >100K FLOPs
+• 999,812 rows need <100 FLOPs`,
+   draw: drawRowRow},
+
+  // 2 ── Tiling concept ────────────────────────────────────────
+  {tag:'03', title:'TileSpGEMM — Divide into Tiles',
+   body:`<strong>Key idea:</strong> Replace variable-length rows with
+<em>fixed-size sparse tiles</em> as the basic work unit.
+
+A 16×16 tile holds at most 256 nonzeros — always fits in on-chip shared memory.
+
+Benefits:
+• Fixed work per unit → balanced load
+• Bounded scratchpad → no global temporary allocation
+• 2-D structure → efficient bitmask accumulation`,
+   hi:[5,6,7], dur:5000,
+   extra:`This demo uses <b>4×4 tiles</b> on an <b>8×8 matrix</b> for visual clarity.
+(Real TileSpGEMM uses 16×16.)
+
+A has <b>3 non-empty tiles</b>:
+• T(0,0): 5 NNZ
+• T(0,1): 1 NNZ  
+• T(1,1): 5 NNZ
+T(1,0) is empty.`,
+   draw: drawTiling},
+
+  // 3 ── Sparse tile data structure ────────────────────────────
+  {tag:'04', title:'Sparse Tile Data Structure',
+   body:`Each tile stores nonzeros in <strong>compact CSR-style</strong>:
+
+<strong>rowPtr[16]</strong> — 8-bit row offsets (values 0–255)
+<strong>rowIdx[nnz]</strong> — 4-bit local row index packed in uint8
+<strong>colIdx[nnz]</strong> — 4-bit local col index packed in uint8
+<strong>val[nnz]</strong>    — float64 values
+<strong>mask[16]</strong>    — 16-bit bitmask per row (1 bit per column)
+
+The tile size T=16 is chosen to fully exploit uint8 (indices 0–15) and uint16 (16-bit masks).`,
+   hi:[8,9,10,11], dur:6000,
+   extra:`<b>Space comparison for T(0,0):</b><br>
+CSR (global): 5 × (4+4+8) = 80 bytes<br>
+Tiled (local): 5 × (1+1+8) + 16 + 16×2 = 82 bytes<br><br>
+<em>At scale, tiled format saves ≈31 MB vs CSR on typical benchmarks.</em>`,
+   draw: drawDataStruct},
+
+  // 4 ── Step 1: tile structure ─────────────────────────────────
+  {tag:'05', title:'Step 1 — Tile Structure of C',
+   body:`Build compressed tile-level matrices <strong>A′</strong> and <strong>B′</strong>:
+• Non-empty tile = one nonzero in A′/B′
+• Sizes: ⌈m/T⌉ × ⌈n/T⌉ = <strong>2×2</strong>
+
+Run symbolic SpGEMM <strong>C′ = A′ × B′</strong> (via cuSPARSE):
+→ Positions of non-zero entries in C′ = non-empty tiles of C.
+
+Cost: <em>always &lt;5% of total runtime</em>.`,
+   hi:[12,13,14], dur:5000,
+   extra:`<b>A′ (tile structure):</b><br>
+[ 1  1 ]<br>
+[ 0  1 ]<br><br>
+<b>C′ = A′ × A′:</b><br>
+[ 1  2 ] → tiles (0,0) and (0,1) non-empty<br>
+[ 0  1 ] → tile (1,1) non-empty<br><br>
+<em>3 output tiles found; T(1,0) is empty.</em>`,
+   draw: drawStep1},
+
+  // 5 ── Step 2a: binary search ──────────────────────────────────
+  {tag:'06', title:'Step 2 — Binary Search Set Intersection',
+   body:`For each output tile <strong>C(0,1)</strong>, find matched pairs:
+
+Search <strong>tileColIdx_A[row 0]</strong> = [0, 1]
+against <strong>tileRowIdx_B[col 1]</strong> = [0, 1]
+
+Binary search finds intersections:
+  → k=0 match: A(0,0) × B(0,1)
+  → k=1 match: A(0,1) × B(1,1)
+
+One warp (32 CUDA threads) per output tile.
+Binary search is faster than merge for unequal-length arrays.`,
+   hi:[15,16,17,18], dur:6000,
+   extra:`<b>Focused tile: C(0,1)</b> (rows 0–3, cols 4–7)<br><br>
+tileColIdx_A row 0: [0, 1]<br>
+tileRowIdx_B col 1: [0, 1]<br><br>
+<b>2 matched pairs found</b><br>
+Pair 1: T_A(0,0) × T_A(0,1)<br>
+Pair 2: T_A(0,1) × T_A(1,1)`,
+   draw: drawBinarySearch},
+
+  // 6 ── Step 2b: bitmask ──────────────────────────────────────
+  {tag:'07', title:'Step 2 — Bitmask AtomicOr',
+   body:`For each matched pair, traverse nonzeros of the A-tile:
+• Column index of each A-nonzero → <em>selects a row of B's bitmask</em>
+• <strong>AtomicOr</strong> that B bitmask row into C's bitmask
+
+<strong>C_mask[r] |= B_mask[c_a]</strong>  for each (r, c_a) in A-tile
+
+Final bitmask encodes the <em>exact sparsity structure</em> of C's tile — without any numeric computation.
+Row pointers and nnz derived from <code>popcount</code>.`,
+   hi:[19,20,21,22], dur:6000,
+   extra:`<b>C(0,1) bitmask computation:</b><br>
+After pair T_A(0,0)×T_A(0,1):<br>
+C_mask[1] |= 0001 → <b>0001</b><br><br>
+After pair T_A(0,1)×T_A(1,1):<br>
+C_mask[1] |= 0001 → <b>0001</b><br><br>
+<em>C(0,1) has 1 nonzero at local (row=1, col=0)</em><br>
+= global C[1][4] = 7 ✓`,
+   draw: drawBitmask},
+
+  // 7 ── Step 3: adaptive accumulator ───────────────────────────
+  {tag:'08', title:'Step 3 — Adaptive Accumulator',
+   body:`After allocating C from nnz counts, compute actual values.
+
+Threshold <strong>τ = 192</strong> (75% of 256):
+
+If <strong>nnz ≥ τ</strong>:  use <em>dense</em> 256-element shared-mem array
+  → accumulate products at exact (r,c) positions
+  → compress using known bitmask
+
+If <strong>nnz &lt; τ</strong>:  use <em>sparse</em> accumulator
+  → directly use column index from bitmask
+  → AtomicAdd at known positions
+
+All intermediate data stays in <strong>on-chip shared memory</strong>.`,
+   hi:[23,24,25,26], dur:5000,
+   extra:`<b>C(0,1):</b> nnz=1 < τ=12* → <b>sparse</b><br>
+<b>C(0,0):</b> nnz=7 < τ=12* → <b>sparse</b><br>
+<b>C(1,1):</b> nnz=4 < τ=12* → <b>sparse</b><br><br>
+<em>*τ=12 for 4×4 demo tiles (75% of 16); τ=192 for real 16×16 tiles.</em><br><br>
+No global memory allocated for intermediates!`,
+   draw: drawAccumulator},
+
+  // 8 ── Step 3 numeric compute ──────────────────────────────────
+  {tag:'09', title:'Step 3 — Numeric Tile Multiplication',
+   body:`For each matched pair (A_tile, B_tile):
+
+  for each nonzero (r_a, c_a, v_a) in A_tile:
+    for each nonzero (c_b, v_b) in B_tile row c_a:
+      accum[r_a][c_b] += v_a × v_b
+
+Products accumulate in shared memory.
+After all pairs, the accum values are written to global memory using the row/col indices from Step 2.
+
+<strong>One warp per output tile</strong> minimises thread synchronization cost.`,
+   hi:[27,28,29,30], dur:6000,
+   extra:`<b>C(0,1) computation:</b><br>
+Pair 1: T_A(0,0) × T_A(0,1)<br>
+• A[1][1]=3, B[1][0]=1 → 3×1=3<br>
+  accum[1][0] += 3<br><br>
+Pair 2: T_A(0,1) × T_A(1,1)<br>
+• A[1][0]=1, B[0][0]=4 → 1×4=4<br>
+  accum[1][0] += 4<br><br>
+<b>C[1][4] = 3 + 4 = 7</b> ✓`,
+   draw: drawNumeric},
+
+  // 9 ── Final result ───────────────────────────────────────────
+  {tag:'10', title:'Result — Final C = A² Assembly',
+   body:`All sparse tiles of C are assembled into the final output matrix.
+
+<strong>Key advantages of TileSpGEMM:</strong>
+① Load balance: every tile has ≤256 nonzeros (bounded work unit)
+② No global intermediate: all computation in shared memory
+③ Efficient accumulator: bitmask gives exact C structure before numerics
+
+Each tile is computed by <em>one warp</em> independently — maximising GPU parallelism.`,
+   hi:[31,32], dur:5000,
+   extra:`<b>C = A² (8×8):</b><br>
+Non-zero entries: ${
+  Array.from({length:8},(_,i)=>Array.from({length:8},(_,j)=>C_computed[i][j]?`C[${i}][${j}]=${C_computed[i][j]}`:'').filter(x=>x)).flat().join(', ')
+}<br><br>
+Total NNZ(C) = ${C_computed.flat().filter(x=>x).length}<br><br>
+<em>Result verified against cuSPARSE RowSpGEMM ✓</em>`,
+   draw: drawResult},
+];
+
+/* ═══════════════════════════════════════════════════════════════════
+   PSEUDOCODE LINES (shared, highlighted per step)
+═══════════════════════════════════════════════════════════════════ */
+const PSEUDO_LINES = [
+  /*0*/ `<span class="cm">// ── Overview ───────────────────────────────</span>`,
+  /*1*/ `<span class="kw">for</span> each row i <span class="kw">in</span> A <span class="kw">parallel</span> <span class="cm">// issue #1: imbalance</span>`,
+  /*2*/ `  predict size(C_row_i) <span class="cm">// issue #2: space</span>`,
+  /*3*/ `  malloc C_row_i`,
+  /*4*/ `  accumulate products <span class="cm">// issue #3: SPA</span>`,
+  /*5*/ `<span class="cm">// ── TileSpGEMM ─────────────────────────────</span>`,
+  /*6*/ `divide A, B into <span class="num">16</span>×<span class="num">16</span> tiles`,
+  /*7*/ `each tile fits in on-chip shared memory`,
+  /*8*/ `<span class="cm">// Tile data structure</span>`,
+  /*9*/ `tilePtr[tilem+<span class="num">1</span>] <span class="cm">// tile-row offsets</span>`,
+  /*10*/`rowPtr[numTiles×<span class="num">16</span>] <span class="cm">// uint8 per tile</span>`,
+  /*11*/`mask[numTiles×<span class="num">16</span>] <span class="cm">// uint16 bitmask</span>`,
+  /*12*/`<span class="cm">// ── Step 1: tile structure ──────────────────</span>`,
+  /*13*/`A' ← tile layout of A; B' ← tile layout of B`,
+  /*14*/`<span class="fn">SpGEMM</span>(A', B') → tile structure of C`,
+  /*15*/`<span class="cm">// ── Step 2: symbolic ────────────────────────</span>`,
+  /*16*/`<span class="kw">for</span> each tile C_ij <span class="kw">in parallel</span> <span class="cm">// 1 warp/tile</span>`,
+  /*17*/`  intersection ← <span class="fn">BinarySearch</span>(colIdx_A[i], rowIdx_B[j])`,
+  /*18*/`  <span class="kw">for</span> matched pair (A_ik, B_kj)`,
+  /*19*/`<span class="cm">// ── Step 2b: bitmask ─────────────────────────</span>`,
+  /*20*/`    <span class="kw">for</span> nonzero (r,c) <span class="kw">in</span> A_ik`,
+  /*21*/`      <span class="fn">AtomicOr</span>(C_mask[r], B_mask_kj[c])`,
+  /*22*/`  C_rowPtr, nnz ← <span class="fn">popcount</span>(C_mask)`,
+  /*23*/`<span class="cm">// ── Step 3: numeric ──────────────────────────</span>`,
+  /*24*/`<span class="kw">if</span> nnz >= τ  <span class="cm">// τ = 192 (75% of 256)</span>`,
+  /*25*/`  use dense 256-elem shared-mem accumulator`,
+  /*26*/`<span class="kw">else</span>  use sparse accumulator`,
+  /*27*/`<span class="kw">for</span> matched pair (A_ik, B_kj)`,
+  /*28*/`  <span class="kw">for</span> (r_a, c_a, v_a) <span class="kw">in</span> A_ik`,
+  /*29*/`    <span class="kw">for</span> (c_b, v_b) <span class="kw">in</span> B_kj[row c_a]`,
+  /*30*/`      <span class="fn">AtomicAdd</span>(accum[r_a][c_b], v_a × v_b)`,
+  /*31*/`<span class="cm">// ── Write result ────────────────────────────</span>`,
+  /*32*/`write all C tiles to global memory → C`,
+];
+
+/* ═══════════════════════════════════════════════════════════════════
+   CANVAS SETUP
+═══════════════════════════════════════════════════════════════════ */
+const canvas = document.getElementById('cv');
+const ctx    = canvas.getContext('2d');
+let W = 800, H = 500;
+
+function resize(){
+  const wrap = document.getElementById('cvwrap');
+  W = wrap.clientWidth; H = wrap.clientHeight;
+  canvas.width = W; canvas.height = H;
+  draw();
+}
+window.addEventListener('resize', resize);
+
+/* ── Drawing helpers ──────────────────────────────────────────── */
+function clr(c){ ctx.fillStyle=c; ctx.strokeStyle=c; }
+function rect(x,y,w,h,fill,stroke,lw=1){
+  if(fill){ ctx.fillStyle=fill; ctx.fillRect(x,y,w,h); }
+  if(stroke){ ctx.strokeStyle=stroke; ctx.lineWidth=lw; ctx.strokeRect(x,y,w,h); }
+}
+function txt(s,x,y,{size=12,color='#e6edf3',align='center',bold=false}={}){
+  ctx.fillStyle=color; ctx.textAlign=align;
+  ctx.font=`${bold?'700 ':''}${size}px 'Segoe UI',system-ui,sans-serif`;
+  ctx.fillText(s,x,y);
+}
+function mono(s,x,y,{size=11,color='#e6edf3',align='center'}={}){
+  ctx.fillStyle=color; ctx.textAlign=align;
+  ctx.font=`${size}px 'Cascadia Code','Consolas',monospace`;
+  ctx.fillText(s,x,y);
+}
+function arrow(x1,y1,x2,y2,color='#58a6ff',lw=1.5){
+  ctx.save(); ctx.strokeStyle=color; ctx.fillStyle=color; ctx.lineWidth=lw;
+  ctx.beginPath(); ctx.moveTo(x1,y1); ctx.lineTo(x2,y2); ctx.stroke();
+  const a=Math.atan2(y2-y1,x2-x1);
+  ctx.beginPath(); ctx.moveTo(x2,y2);
+  ctx.lineTo(x2-8*Math.cos(a-0.4),y2-8*Math.sin(a-0.4));
+  ctx.lineTo(x2-8*Math.cos(a+0.4),y2-8*Math.sin(a+0.4));
+  ctx.closePath(); ctx.fill(); ctx.restore();
+}
+function fade(t,d=0.3){ return Math.min(1,t/d); }
+function easeInOut(t){ return t<0.5?2*t*t:1-2*(1-t)*(1-t); }
+function lerp(a,b,t){ return a+(b-a)*t; }
+
+/* ── Draw a matrix grid ───────────────────────────────────────── */
+function drawMatrix(mat, ox, oy, cs, {
+  showVals=true, showTileBorders=false,
+  highlightCells=null, alpha=1, label='',
+  tileAlpha=1
+}={}){
+  const n = mat.length;
+  ctx.save(); ctx.globalAlpha=alpha;
+
+  for(let i=0;i<n;i++) for(let j=0;j<n;j++){
+    const v  = mat[i][j];
+    const x  = ox+j*cs, y = oy+i*cs;
+    const ti = Math.floor(i/T), tj = Math.floor(j/T);
+    const tk = `${ti}${tj}`;
+    const tinfo = TC[tk];
+    const fill  = v !== 0 ? tinfo.fill : ZERO_CLR;
+    const stroke= v !== 0 ? tinfo.stroke : '#2a2d33';
+
+    // highlight override
+    const hl = highlightCells && highlightCells.some(([r,c])=>r===i&&c===j);
+    rect(x,y,cs,cs, hl ? tinfo.bright+'88' : fill, stroke, hl?1.5:0.5);
+
+    if(showVals && v!==0){
+      txt(String(v),x+cs/2,y+cs/2+4,{size:cs>28?12:9,color:hl?'#fff':tinfo.bright});
+    }
+  }
+
+  if(showTileBorders){
+    ctx.save(); ctx.globalAlpha=tileAlpha;
+    for(let ti=0;ti<2;ti++) for(let tj=0;tj<2;tj++){
+      const tk=`${ti}${tj}`;
+      const tx=ox+tj*T*cs, ty=oy+ti*T*cs, tw=T*cs, th=T*cs;
+      const ec=TC[tk].stroke;
+      if(TILES[tk].nnz===0){
+        ctx.setLineDash([4,3]);
+        rect(tx,ty,tw,th,null,ec+'66',1.5);
+        ctx.setLineDash([]);
+      } else {
+        rect(tx,ty,tw,th,null,ec,2.5);
+      }
+      txt(TC[tk].label, tx+tw/2, ty+th/2+(TILES[tk].nnz?0:6),
+          {size:9,color:TC[tk].bright+(TILES[tk].nnz?'':88)});
+    }
+    ctx.restore();
+  }
+
+  if(label) txt(label, ox+n*cs/2, oy-10, {size:16,bold:true,color:'#f0f6fc'});
+  ctx.restore();
+}
+
+/* ── Draw a single tile zoomed ────────────────────────────────── */
+function drawTile(tkey, ox, oy, cs, {alpha=1,highlight=[]}={}){
+  const td=TILES[tkey], tc=TC[tkey];
+  ctx.save(); ctx.globalAlpha=alpha;
+  for(let i=0;i<4;i++) for(let j=0;j<4;j++){
+    const v=td.data[i][j], x=ox+j*cs, y=oy+i*cs;
+    const isHL=highlight.some(([r,c])=>r===i&&c===j);
+    rect(x,y,cs,cs, isHL?tc.bright+'44':( v?tc.fill:ZERO_CLR),
+         isHL?tc.bright:( v?tc.stroke:'#2a2d33'), isHL?2:0.5);
+    if(v) txt(String(v),x+cs/2,y+cs/2+4,{size:cs>24?11:8,color:isHL?'#fff':tc.bright});
+  }
+  rect(ox,oy,4*cs,4*cs,null,tc.stroke,2.5);
+  txt(tc.label, ox+2*cs, oy-10, {size:10,color:tc.bright,bold:true});
+  ctx.restore();
+}
+
+/* ── Draw bitmask row ─────────────────────────────────────────── */
+function drawBitRow(mask, bits, ox, oy, bs, color, label='', highlight=-1){
+  for(let b=0;b<bits;b++){
+    const set=(mask>>b)&1;
+    const x=ox+(bits-1-b)*bs, bclr=set?(highlight===b?'#fff':color):ZERO_CLR;
+    rect(x,oy,bs,bs, bclr, set?color:'#2a2d33', 0.8);
+    mono(set?'1':'0', x+bs/2, oy+bs/2+4,{size:bs>16?11:9,color:set?'#111':'#444'});
+  }
+  if(label) txt(label, ox-6, oy+bs/2+4, {size:10,color:'#8b949e',align:'right'});
+}
+
+/* ── Draw array bar ───────────────────────────────────────────── */
+function drawArr(vals, ox, oy, bw, bh, colorFn, labels=null, title=''){
+  const n=vals.length;
+  if(title) txt(title, ox+n*bw/2, oy-12,{size:10,color:'#8b949e'});
+  for(let i=0;i<n;i++){
+    const x=ox+i*bw, c=colorFn(i,vals[i]);
+    rect(x,oy,bw,bh,c+'33',c,0.8);
+    mono(String(vals[i]),x+bw/2,oy+bh/2+4,{size:bw>22?10:8,color:'#e6edf3'});
+    if(labels) txt(labels[i],x+bw/2,oy+bh+12,{size:8,color:'#6e7681'});
+  }
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   STEP DRAW FUNCTIONS
+═══════════════════════════════════════════════════════════════════ */
+function drawIntro(t){
+  const a=easeInOut(fade(t,0.5));
+  const cs=36, mx=(W-3*N*cs-80)/2;
+
+  // title
+  ctx.save(); ctx.globalAlpha=a;
+  txt('C  =  A  ×  B', W/2, 46, {size:22, bold:true, color:'#58a6ff'});
+  txt('Sparse General Matrix-Matrix Multiplication', W/2, 70,
+      {size:12, color:'#6e7681'});
+  ctx.restore();
+
+  // matrices
+  const ay=100, bx=mx+N*cs+80, cx=bx+N*cs+80;
+  ctx.save(); ctx.globalAlpha=a;
+  drawMatrix(A, mx, ay, cs, {showVals:true, label:'A (sparse, 8×8)'});
+  drawMatrix(A, bx, ay, cs, {showVals:true, label:'B = A'});
+  drawMatrix(C_computed, cx, ay, cs, {showVals:true, label:'C = A²'});
+  txt('×', mx+N*cs+40, ay+N*cs/2+8, {size:26,bold:true,color:'#f0f6fc'});
+  txt('=', bx+N*cs+40, ay+N*cs/2+8, {size:26,bold:true,color:'#f0f6fc'});
+  ctx.restore();
+
+  // stats badges
+  const bads=[
+    {l:'NNZ(A)',v:'12'},{l:'NNZ(C)',v:String(C_computed.flat().filter(x=>x).length)},
+    {l:'Density',v:'18.75%'},{l:'Target',v:'C = A²'},
+  ];
+  const bx0=W/2-(bads.length*110)/2, by=ay+N*cs+30;
+  ctx.save(); ctx.globalAlpha=a;
+  bads.forEach((b,i)=>{
+    const bxi=bx0+i*115;
+    rect(bxi,by,105,38,'#161b22','#30363d',1);
+    txt(b.l,bxi+52,by+13,{size:9,color:'#6e7681'});
+    txt(b.v,bxi+52,by+28,{size:13,bold:true,color:'#58a6ff'});
+  });
+  ctx.restore();
+}
+
+function drawRowRow(t){
+  const cs=34, ox=(W-N*cs)/2-20, oy=80;
+  const a=easeInOut(fade(t,0.4));
+  ctx.save(); ctx.globalAlpha=a;
+  drawMatrix(A, ox, oy, cs, {showVals:true});
+  txt('Row-Row SpGEMM: Each row computed independently', W/2, oy-20,
+      {size:13,bold:true,color:'#f0f6fc'});
+  ctx.restore();
+
+  // row-length bars
+  const barX=ox+N*cs+50, barMaxW=160;
+  const nnzPerRow=A.map(r=>r.filter(x=>x).length);
+  const maxNnz=Math.max(...nnzPerRow);
+  const rowColors=['#388bfd','#3fb950','#da3633','#8957e5','#e3b341','#ff7b72','#79c0ff','#a5d6ff'];
+
+  ctx.save(); ctx.globalAlpha=a;
+  txt('Row lengths (NNZ per row)', barX+barMaxW/2, oy-6,{size:11,bold:true,color:'#8b949e'});
+  nnzPerRow.forEach((n,i)=>{
+    const by=oy+i*cs+cs*0.2, bh=cs*0.6;
+    const bw=lerp(0,n/maxNnz*barMaxW, easeInOut(Math.min(1,t*3-i*0.1)));
+    rect(barX,by,barMaxW,bh,'#1c2128','#30363d',0.5);
+    if(bw>0) rect(barX,by,bw,bh,rowColors[i]+'66',rowColors[i],1);
+    txt(`${n}`,barX+barMaxW+8,by+bh/2+4,{size:10,color:rowColors[i],align:'left'});
+  });
+  ctx.restore();
+
+  // issue annotations
+  const issues=[
+    {y:oy+0*cs+18, text:'① Long rows dominate runtime (load imbalance)', clr:'#ff7b72'},
+    {y:oy+3*cs+18, text:'② Large intermediate buffers needed', clr:'#f0883e'},
+    {y:oy+5*cs+18, text:'③ Sparse accumulator: random insertions', clr:'#e3b341'},
+  ];
+  ctx.save();
+  issues.forEach(is=>{
+    const alpha2=easeInOut(Math.max(0,Math.min(1,(t-0.3)*3)));
+    ctx.globalAlpha=a*alpha2;
+    txt(is.text, W/2, is.y+N*cs/2+60,{size:11,color:is.clr});
+  });
+  ctx.restore();
+}
+
+function drawTiling(t){
+  const cs=36, ox=(W-2*(N*cs+60))/2, oy=70;
+  const bx=ox+N*cs+60;
+  const a=easeInOut(fade(t,0.4));
+  const tileA=easeInOut(Math.max(0,Math.min(1,(t-0.2)*2)));
+
+  ctx.save(); ctx.globalAlpha=a;
+  drawMatrix(A, ox, oy, cs, {showVals:true, showTileBorders:true, tileAlpha:tileA, label:'A'});
+  drawMatrix(A, bx, oy, cs, {showVals:true, showTileBorders:true, tileAlpha:tileA, label:'B = A'});
+
+  txt('÷ tiles', W/2, oy+N*cs/2+8, {size:20,bold:true,color:'#f0f6fc'});
+  txt('TileSpGEMM: fixed 4×4 sparse tiles as work units', W/2, oy+N*cs+38,
+      {size:12,bold:true,color:'#8b949e'});
+
+  // tile summary
+  const sumX=ox, sumY=oy+N*cs+55;
+  const tiles2=[
+    {k:'00',x:0},{k:'01',x:160},{k:'10',x:320},{k:'11',x:480},
+  ];
+  ctx.globalAlpha=a*easeInOut(Math.max(0,t-0.5)*2);
+  tiles2.forEach(({k,x})=>{
+    const tc2=TC[k], td=TILES[k];
+    rect(sumX+x,sumY,140,32,tc2.fill+'44',tc2.stroke,1);
+    txt(`${tc2.label}: ${td.nnz} NNZ`,sumX+x+70,sumY+20,{size:11,color:tc2.bright});
+  });
+  ctx.restore();
+}
+
+function drawDataStruct(t){
+  const tkey='00', tc2=TC[tkey], td=TILES[tkey];
+  const cs=46, ox=60, oy=80;
+  const a=easeInOut(fade(t,0.3));
+
+  ctx.save(); ctx.globalAlpha=a;
+  txt('Tile T(0,0) — Sparse Tile Data Structure', W/2, 48,
+      {size:15,bold:true,color:'#f0f6fc'});
+  drawTile(tkey, ox, oy, cs);
+  txt('T(0,0)', ox+2*cs, oy+4*cs+22,{size:10,color:tc2.bright});
+  ctx.restore();
+
+  // arrays panel
+  const ax=ox+4*cs+50, ay=oy;
+  const bw=26, bh=22;
+
+  // collect nonzeros in row order
+  const nzs=[];
+  for(let r=0;r<4;r++) for(let c=0;c<4;c++) if(td.data[r][c]) nzs.push({r,c,v:td.data[r][c]});
+
+  // rowPtr
+  ctx.save();
+  const rpa=[0,0,0,0];
+  let cnt=0;
+  for(let r=0;r<4;r++){
+    rpa[r]=cnt;
+    for(let c=0;c<4;c++) if(td.data[r][c]) cnt++;
+  }
+  const rowPtrVals=[...rpa,cnt];
+  const a1=easeInOut(Math.max(0,Math.min(1,(t-0.1)*2)));
+  ctx.globalAlpha=a*a1;
+  drawArr(rowPtrVals,ax,ay+0,bw,bh,(_,v)=>tc2.stroke,
+    rowPtrVals.map((_,i)=>`r${Math.min(i,3)}`), 'rowPtr[5]');
+  ctx.restore();
+
+  // rowIdx, colIdx, val
+  const a2=easeInOut(Math.max(0,Math.min(1,(t-0.25)*2)));
+  ctx.save(); ctx.globalAlpha=a*a2;
+  drawArr(nzs.map(z=>z.r), ax, ay+60, bw, bh, ()=>tc2.stroke+'aa', null, 'rowIdx[5]');
+  drawArr(nzs.map(z=>z.c), ax, ay+105, bw, bh, ()=>'#388bfd', null, 'colIdx[5]');
+  drawArr(nzs.map(z=>z.v), ax, ay+150, bw, bh, ()=>'#3fb950', null, 'val[5]');
+  ctx.restore();
+
+  // bitmasks
+  const a3=easeInOut(Math.max(0,Math.min(1,(t-0.45)*2)));
+  ctx.save(); ctx.globalAlpha=a*a3;
+  txt('mask[4]  (1 bit per column)', ax+90, ay+220, {size:11,bold:true,color:'#8b949e'});
+  for(let r=0;r<4;r++){
+    drawBitRow(td.mask[r], 4, ax, ay+232+r*24, 20, tc2.bright, `r${r}`);
+  }
+  ctx.restore();
+
+  // arrows from tile cell to arrays
+  if(t>0.6){
+    const a4=easeInOut((t-0.6)*5);
+    // highlight first nonzero: (0,0)=2
+    ctx.save(); ctx.globalAlpha=a*a4;
+    arrow(ox+0*cs+cs,oy+0*cs+cs/2, ax-6, ay+bh/2+6, tc2.bright, 1.5);
+    ctx.restore();
+  }
+}
+
+function drawStep1(t){
+  const cs=30, aox=W/2-N*cs-80, bx=W/2+80, oy=80;
+  const a=easeInOut(fade(t,0.4));
+
+  ctx.save(); ctx.globalAlpha=a;
+  drawMatrix(A, aox, oy, cs, {showVals:false, showTileBorders:true, tileAlpha:1, label:"A'"});
+  drawMatrix(A, bx,  oy, cs, {showVals:false, showTileBorders:true, tileAlpha:1, label:"B' = A'"});
+  txt('×', W/2-36, oy+N*cs/2+8, {size:22,bold:true,color:'#f0f6fc'});
+  ctx.restore();
+
+  // A' matrix (2×2, symbolic)
+  const mcs=44, mc=W/2-mcs-8, mby=W/2+mcs+8, moy=H-130;
+  const aprime=[[1,1],[0,1]]; // A'
+  const cprime=[[1,1],[0,1]]; // C' = A'A'
+
+  const a2=easeInOut(Math.max(0,(t-0.3)*2));
+  ctx.save(); ctx.globalAlpha=a*a2;
+  txt("Tile-level matrices (A' and B' are 2×2):", W/2, moy-28,
+      {size:12,bold:true,color:'#8b949e'});
+
+  // draw A'
+  const a2ox=W/2-3*mcs-50, a2oy=moy;
+  for(let i=0;i<2;i++) for(let j=0;j<2;j++){
+    const v=aprime[i][j], tk=`${i}${j}`;
+    const x=a2ox+j*mcs, y=a2oy+i*mcs;
+    rect(x,y,mcs,mcs, v?TC[tk].fill:ZERO_CLR, v?TC[tk].stroke:'#2a2d33', v?1.5:0.5);
+    txt(v?'●':'○', x+mcs/2, y+mcs/2+5, {size:16,color:v?TC[tk].bright:'#333'});
+  }
+  txt("A'", a2ox+mcs, a2oy-12,{size:13,bold:true,color:'#f0f6fc'});
+  txt('×', a2ox+2*mcs+12, a2oy+mcs+5,{size:18,bold:true,color:'#f0f6fc'});
+
+  // draw B'
+  const b2ox=a2ox+2*mcs+32;
+  for(let i=0;i<2;i++) for(let j=0;j<2;j++){
+    const v=aprime[i][j], tk=`${i}${j}`;
+    const x=b2ox+j*mcs, y=a2oy+i*mcs;
+    rect(x,y,mcs,mcs, v?TC[tk].fill:ZERO_CLR, v?TC[tk].stroke:'#2a2d33', v?1.5:0.5);
+    txt(v?'●':'○', x+mcs/2, y+mcs/2+5, {size:16,color:v?TC[tk].bright:'#333'});
+  }
+  txt("B'", b2ox+mcs, a2oy-12,{size:13,bold:true,color:'#f0f6fc'});
+  txt('=', b2ox+2*mcs+12, a2oy+mcs+5,{size:18,bold:true,color:'#f0f6fc'});
+
+  // draw C'
+  const c2ox=b2ox+2*mcs+32;
+  const a3=easeInOut(Math.max(0,(t-0.55)*4));
+  ctx.globalAlpha=a*a3;
+  for(let i=0;i<2;i++) for(let j=0;j<2;j++){
+    const v=cprime[i][j], tk=`${i}${j}`;
+    const x=c2ox+j*mcs, y=a2oy+i*mcs;
+    rect(x,y,mcs,mcs, v?TC[tk].fill+'cc':ZERO_CLR, v?TC[tk].stroke:'#2a2d33', v?2.5:0.5);
+    txt(v?TC[tk].label:'empty', x+mcs/2, y+mcs/2+5,{size:v?8:9,color:v?TC[tk].bright:'#444'});
+  }
+  txt("C'", c2ox+mcs, a2oy-12,{size:13,bold:true,color:'#3fb950'});
+  txt('3 non-empty tiles found!', c2ox+mcs, a2oy+2*mcs+20,{size:11,color:'#3fb950',bold:true});
+  ctx.restore();
+}
+
+function drawBinarySearch(t){
+  const a=easeInOut(fade(t,0.35));
+
+  ctx.save(); ctx.globalAlpha=a;
+  txt('Step 2: Binary Search Set Intersection — for C tile (0,1)', W/2, 40,
+      {size:14,bold:true,color:'#f0f6fc'});
+  txt('Find all k such that A[0][k] and B[k][1] are both non-empty tiles',
+      W/2, 60, {size:11,color:'#6e7681'});
+  ctx.restore();
+
+  // show two arrays
+  const bw=52, bh=36, ay1=100, ay2=180;
+  const arrA=[0,1]; // tileColIdx_A row 0
+  const arrB=[0,1]; // tileRowIdx_B col 1
+
+  // animate search pointer
+  const phase=Math.min(1,t*1.8);
+  const pointer=Math.floor(phase*3);
+
+  ctx.save(); ctx.globalAlpha=a;
+  txt('tileColIdx_A [row 0]  =  [', W/2-180, ay1+bh/2+6, {size:12,color:'#8b949e',align:'left'});
+  arrA.forEach((v,i)=>{
+    const x=W/2-30+i*bw;
+    const isMatch=pointer>i;
+    rect(x,ay1,bw,bh, isMatch?TC[`0${v}`].fill:'#21262d', isMatch?TC[`0${v}`].stroke:'#30363d', isMatch?2:0.8);
+    txt(String(v), x+bw/2, ay1+bh/2+5, {size:16,bold:true,color:isMatch?TC[`0${v}`].bright:'#6e7681'});
+    if(isMatch){
+      txt('✓', x+bw/2, ay1-10, {size:12,color:'#3fb950'});
+    }
+  });
+  txt(']', W/2+30+arrA.length*bw-bw, ay1+bh/2+6, {size:12,color:'#8b949e',align:'left'});
+
+  txt('tileRowIdx_B [col 1]  =  [', W/2-180, ay2+bh/2+6, {size:12,color:'#8b949e',align:'left'});
+  arrB.forEach((v,i)=>{
+    const x=W/2-30+i*bw;
+    const isMatch=pointer>i;
+    rect(x,ay2,bw,bh, isMatch?TC[`${v}1`].fill:'#21262d', isMatch?TC[`${v}1`].stroke:'#30363d', isMatch?2:0.8);
+    txt(String(v), x+bw/2, ay2+bh/2+5, {size:16,bold:true,color:isMatch?TC[`${v}1`].bright:'#6e7681'});
+  });
+  txt(']', W/2+30+arrB.length*bw-bw, ay2+bh/2+6, {size:12,color:'#8b949e',align:'left'});
+  ctx.restore();
+
+  // binary search animation
+  if(t>0.25){
+    const a2=easeInOut(Math.min(1,(t-0.25)*3));
+    ctx.save(); ctx.globalAlpha=a*a2;
+    const searchX=W/2-30, searchY=260;
+    txt('Binary search: lo=0, hi=1', searchX-40, searchY, {size:11,color:'#6e7681',align:'left'});
+
+    // step 1: mid=0, found k=0
+    const s1a=easeInOut(Math.min(1,(t-0.3)*4));
+    ctx.globalAlpha=a*s1a;
+    rect(searchX,searchY+15,bw,bh,TC['00'].fill,TC['00'].stroke,2);
+    txt('k=0 found!', searchX+bw/2, searchY+15+bh/2+5, {size:10,bold:true,color:TC['00'].bright});
+    txt('Match: A_tile(0,0) × B_tile(0,1)', searchX+bw+8, searchY+15+bh/2+5,
+        {size:11,color:TC['00'].bright,align:'left'});
+
+    // step 2: k=1
+    const s2a=easeInOut(Math.min(1,(t-0.55)*4));
+    ctx.globalAlpha=a*s2a;
+    rect(searchX,searchY+65,bw,bh,TC['01'].fill,TC['01'].stroke,2);
+    txt('k=1 found!', searchX+bw/2, searchY+65+bh/2+5, {size:10,bold:true,color:TC['01'].bright});
+    txt('Match: A_tile(0,1) × B_tile(1,1)', searchX+bw+8, searchY+65+bh/2+5,
+        {size:11,color:TC['01'].bright,align:'left'});
+    ctx.restore();
+  }
+
+  // visual: draw matching tiles
+  if(t>0.65){
+    const a3=easeInOut((t-0.65)*5);
+    const cs=28, px=80, py=380;
+    ctx.save(); ctx.globalAlpha=a*a3;
+    txt('Matched tile pairs for C(0,1):', px, py-15, {size:11,bold:true,color:'#8b949e',align:'left'});
+    drawTile('00', px, py, cs);
+    txt('×', px+4*cs+14, py+2*cs+5, {size:18,bold:true,color:'#f0f6fc'});
+    drawTile('01', px+4*cs+30, py, cs);
+    txt('+', px+8*cs+56, py+2*cs+5, {size:18,bold:true,color:'#f0f6fc'});
+    drawTile('01', px+8*cs+72, py, cs);
+    txt('×', px+12*cs+86, py+2*cs+5, {size:18,bold:true,color:'#f0f6fc'});
+    drawTile('11', px+12*cs+102, py, cs);
+    ctx.restore();
+  }
+}
+
+function drawBitmask(t){
+  const a=easeInOut(fade(t,0.3));
+  const bits=4, bs=28;
+  const bsec=bs+6;
+
+  ctx.save(); ctx.globalAlpha=a;
+  txt('Step 2: Bitmask AtomicOr — computing C(0,1) sparsity structure',
+      W/2, 38, {size:14,bold:true,color:'#f0f6fc'});
+  ctx.restore();
+
+  // show A tile (0,1) mask
+  const left=80, oy=70;
+  ctx.save(); ctx.globalAlpha=a;
+  txt('T_A(0,1) bitmask', left, oy-5, {size:11,bold:true,color:TC['01'].bright,align:'left'});
+  for(let r=0;r<4;r++){
+    drawBitRow(TILES['01'].mask[r], bits, left, oy+r*bsec, bs, TC['01'].bright, `r${r}`);
+  }
+  ctx.restore();
+
+  // B tile (1,1) mask
+  const midX=left+bits*bs+90;
+  ctx.save(); ctx.globalAlpha=a;
+  txt('T_B(1,1) bitmask', midX, oy-5, {size:11,bold:true,color:TC['11'].bright,align:'left'});
+  for(let r=0;r<4;r++){
+    drawBitRow(TILES['11'].mask[r], bits, midX, oy+r*bsec, bs, TC['11'].bright, `r${r}`);
+  }
+  ctx.restore();
+
+  // animation: A nonzero at (r=1,c=0) → select B mask row 0 → OR into C mask
+  const phase=Math.min(1,t*1.6-0.2);
+  // C mask accumulation
+  const C_mask=[0,0,0,0];
+  // pair 1 A(0,0)×B(0,1): only A[1][1]=3 contributes (col=1 → B(0,1) row 1 = 0001)
+  if(phase>0.1) C_mask[1]|=TILES['01'].mask[1];
+  // pair 2 A(0,1)×B(1,1): A[1][0]=1 (col=0 → B(1,1) row 0 = 0001)
+  if(phase>0.5) C_mask[1]|=TILES['11'].mask[0];
+
+  const rightX=midX+bits*bs+90;
+  ctx.save();
+  const a2=easeInOut(Math.min(1,phase*3));
+  ctx.globalAlpha=a*a2;
+  txt('C(0,1) mask (accumulating)', rightX, oy-5,
+      {size:11,bold:true,color:'#3fb950',align:'left'});
+  for(let r=0;r<4;r++){
+    drawBitRow(C_mask[r], bits, rightX, oy+r*bsec, bs, '#3fb950', `r${r}`);
+  }
+  ctx.restore();
+
+  // arrows showing the OR operation
+  if(t>0.3){
+    const aa=easeInOut((t-0.3)*4);
+    ctx.save(); ctx.globalAlpha=a*aa;
+    // A(0,1) row 1 bit 0 → B(1,1) row 0
+    const ay2=oy+1*bsec+bs/2;
+    const by2=oy+0*bsec+bs/2;
+    const ax2=left+(bits-1)*bs+bs/2;
+    arrow(ax2,ay2, midX+bs/2, by2, TC['01'].bright, 1.5);
+    txt('col=0 → select row 0', left+bits*bs/2, ay2-4,{size:9,color:TC['01'].bright+'aa'});
+    ctx.restore();
+  }
+  if(t>0.55){
+    const aa=easeInOut((t-0.55)*5);
+    ctx.save(); ctx.globalAlpha=a*aa;
+    const by2=oy+0*bsec+bs/2;
+    arrow(midX+bits*bs/2, by2, rightX-6, oy+1*bsec+bs/2, '#3fb950', 2);
+    txt('AtomicOr → C_mask[1] |= 0001', rightX+bits*bs+6,
+        oy+1*bsec+bs/2+4, {size:9,color:'#3fb950',align:'left'});
+    ctx.restore();
+  }
+
+  // final popcount
+  if(t>0.8){
+    const aa=easeInOut((t-0.8)*6);
+    const nnz=C_mask.reduce((s,m)=>s+m.toString(2).split('').filter(x=>x==='1').length,0);
+    ctx.save(); ctx.globalAlpha=a*aa;
+    const fx=W/2, fy=H-85;
+    rect(fx-160,fy-20,320,60,'#0d1117','#3fb950',2);
+    txt(`popcount(C_mask) = ${nnz} → nnz(C(0,1)) = 1`, fx, fy+5, {size:12,bold:true,color:'#3fb950'});
+    txt('C[1][4] = 7  (global position of the single nonzero)', fx, fy+25,{size:11,color:'#6e7681'});
+    ctx.restore();
+  }
+}
+
+function drawAccumulator(t){
+  const a=easeInOut(fade(t,0.3));
+  ctx.save(); ctx.globalAlpha=a;
+  txt('Step 3: Adaptive Accumulator Selection', W/2, 40, {size:14,bold:true,color:'#f0f6fc'});
+  ctx.restore();
+
+  const threshold=12; // 75% of 4×4 = 12 (scaled for demo; real = 192 of 256)
+  const tiles2=[
+    {k:'00',nnz:7,  x:100},
+    {k:'01',nnz:1,  x:310},
+    {k:'11',nnz:4,  x:520},
+  ];
+
+  const barMaxH=120, barOY=180;
+  const maxNNZ=16;
+
+  tiles2.forEach(({k,nnz,x})=>{
+    const tc2=TC[k];
+    const bh=Math.round(barMaxH*nnz/maxNNZ);
+    const bw=80;
+    const a2=easeInOut(Math.min(1,(t-0.15)*2));
+    ctx.save(); ctx.globalAlpha=a*a2;
+
+    // bar
+    rect(x,barOY,bw,barMaxH,'#1c2128','#30363d',0.5);
+    if(bh>0) rect(x,barOY+(barMaxH-bh),bw,bh, tc2.fill, tc2.stroke, 1.5);
+
+    // threshold line
+    const thY=barOY+barMaxH-Math.round(barMaxH*threshold/maxNNZ);
+    ctx.strokeStyle='#f0883e'; ctx.lineWidth=2; ctx.setLineDash([4,3]);
+    ctx.beginPath(); ctx.moveTo(x-10,thY); ctx.lineTo(x+bw+10,thY); ctx.stroke();
+    ctx.setLineDash([]);
+    if(x===100) txt(`τ=${threshold} (75%)`, x-14, thY-4,{size:9,color:'#f0883e',align:'right'});
+
+    txt(tc2.label, x+bw/2, barOY+barMaxH+15,{size:10,color:tc2.bright});
+    txt(`nnz=${nnz}`, x+bw/2, barOY+barMaxH+28,{size:11,bold:true,color:tc2.bright});
+
+    // sparse/dense label
+    const a3=easeInOut(Math.max(0,(t-0.5)*3));
+    ctx.globalAlpha=a*a3;
+    const isSparse=nnz<threshold;
+    const lbl=isSparse?'SPARSE\naccumulator':'DENSE\naccumulator';
+    const lclr=isSparse?'#58a6ff':'#f0883e';
+    rect(x,barOY+barMaxH+40,bw,36,lclr+'22',lclr,1.5);
+    txt(isSparse?'SPARSE':'DENSE', x+bw/2, barOY+barMaxH+54,{size:10,bold:true,color:lclr});
+    txt(isSparse?'accum':'accum', x+bw/2, barOY+barMaxH+66,{size:9,color:lclr});
+    ctx.restore();
+  });
+
+  // description panel
+  const a2=easeInOut(Math.max(0,(t-0.6)*3));
+  ctx.save(); ctx.globalAlpha=a*a2;
+  const dx=W/2-200, dy=H-120;
+  rect(dx,dy,400,70,'#0d1117','#30363d',1);
+  txt('All 3 tiles use SPARSE accumulator (nnz < τ=12)', dx+200, dy+18,
+      {size:11,bold:true,color:'#58a6ff'});
+  txt('Dense 16×16 shared-mem array: only when nearly full', dx+200, dy+35,
+      {size:10,color:'#6e7681'});
+  txt('No global memory allocated for intermediates ✓', dx+200, dy+52,
+      {size:10,color:'#3fb950',bold:true});
+  ctx.restore();
+}
+
+function drawNumeric(t){
+  const a=easeInOut(fade(t,0.3));
+  ctx.save(); ctx.globalAlpha=a;
+  txt('Step 3: Numeric Tile Multiplication — C(0,1)', W/2, 38,
+      {size:14,bold:true,color:'#f0f6fc'});
+  ctx.restore();
+
+  const cs=40, pair1x=60, pair2x=W/2+30, py=70;
+
+  // Pair 1: T_A(0,0) × T_A(0,1)
+  const a1=easeInOut(Math.min(1,(t-0.05)*2.5));
+  ctx.save(); ctx.globalAlpha=a*a1;
+  txt('Pair 1:', pair1x, py-14,{size:11,bold:true,color:TC['00'].bright,align:'left'});
+  drawTile('00', pair1x, py, cs, {highlight:[[1,1]]});
+  txt('×', pair1x+4*cs+12, py+2*cs+5, {size:20,bold:true,color:'#f0f6fc'});
+  drawTile('01', pair1x+4*cs+26, py, cs, {highlight:[[1,0]]});
+  ctx.restore();
+
+  // product 1 annotation
+  if(t>0.25){
+    const ap=easeInOut((t-0.25)*4);
+    ctx.save(); ctx.globalAlpha=a*ap;
+    const rx=pair1x+8*cs+60, ry=py+70;
+    txt('A[1][1]=3  ×  B[1][0]=1  =  3', rx, ry,{size:12,color:'#3fb950',align:'left'});
+    txt('→ accum[1][0] += 3', rx, ry+18,{size:11,color:'#3fb95088',align:'left'});
+    ctx.restore();
+  }
+
+  // Pair 2: T_A(0,1) × T_A(1,1)
+  const a2=easeInOut(Math.max(0,Math.min(1,(t-0.4)*2.5)));
+  ctx.save(); ctx.globalAlpha=a*a2;
+  txt('Pair 2:', pair2x, py-14,{size:11,bold:true,color:TC['01'].bright,align:'left'});
+  drawTile('01', pair2x, py, cs, {highlight:[[1,0]]});
+  txt('×', pair2x+4*cs+12, py+2*cs+5, {size:20,bold:true,color:'#f0f6fc'});
+  drawTile('11', pair2x+4*cs+26, py, cs, {highlight:[[0,0]]});
+  ctx.restore();
+
+  if(t>0.6){
+    const ap=easeInOut((t-0.6)*4);
+    ctx.save(); ctx.globalAlpha=a*ap;
+    const rx=pair2x+8*cs+60, ry=py+70;
+    txt('A[1][0]=1  ×  B[0][0]=4  =  4', rx, ry,{size:12,color:'#3fb950',align:'left'});
+    txt('→ accum[1][0] += 4', rx, ry+18,{size:11,color:'#3fb95088',align:'left'});
+    ctx.restore();
+  }
+
+  // final value
+  if(t>0.8){
+    const af=easeInOut((t-0.8)*5);
+    ctx.save(); ctx.globalAlpha=a*af;
+    const fx=W/2, fy=H-115;
+    rect(fx-180,fy,360,70,'#0d1117','#3fb950',2);
+    txt('accum[1][0] = 3 + 4 = 7', fx, fy+18,{size:14,bold:true,color:'#3fb950'});
+    txt('C[1][4] = 7  (local tile row=1, col=0 → global row=1, col=4)', fx, fy+38,
+        {size:11,color:'#6e7681'});
+    txt('Verified against cuSPARSE ✓', fx, fy+55, {size:11,color:'#3fb95088'});
+    ctx.restore();
+  }
+}
+
+function drawResult(t){
+  const a=easeInOut(fade(t,0.3));
+  const cs=34;
+
+  ctx.save(); ctx.globalAlpha=a;
+  txt('Final Result — C = A² (assembled from sparse tiles)', W/2, 40,
+      {size:14,bold:true,color:'#3fb950'});
+  ctx.restore();
+
+  // A and C side by side
+  const ox=W/2-N*cs-60, cx=W/2+60, oy=65;
+
+  ctx.save(); ctx.globalAlpha=a;
+  drawMatrix(A, ox, oy, cs, {showVals:true, showTileBorders:true, label:'A (input)'});
+  txt('A²→', W/2-22, oy+N*cs/2+8, {size:20,bold:true,color:'#f0f6fc'});
+  ctx.restore();
+
+  // C tiles fly in
+  const tileOrder=['00','01','11'];
+  tileOrder.forEach((k,idx)=>{
+    const ti=parseInt(k[0]), tj=parseInt(k[1]);
+    const finalX=cx+tj*T*cs, finalY=oy+ti*T*cs;
+    const startX=W+150, startY=oy+ti*T*cs;
+    const delay=0.15+idx*0.2;
+    const af=easeInOut(Math.max(0,Math.min(1,(t-delay)*3)));
+    const ex=lerp(startX,finalX,af), ey=lerp(startY,finalY,af);
+
+    // draw sub-tile at animated position
+    ctx.save(); ctx.globalAlpha=a*af;
+    for(let i=0;i<4;i++) for(let j=0;j<4;j++){
+      const v=C_computed[ti*4+i][tj*4+j];
+      const x=ex+j*cs, y=ey+i*cs;
+      rect(x,y,cs,cs, v?TC[k].fill:ZERO_CLR, v?TC[k].stroke:'#2a2d33', 0.5);
+      if(v) txt(String(v),x+cs/2,y+cs/2+4,{size:cs>24?11:9,color:TC[k].bright});
+    }
+    rect(ex,ey,T*cs,T*cs,null,TC[k].stroke,2.5);
+    ctx.restore();
+  });
+
+  // empty tile (1,0)
+  ctx.save(); ctx.globalAlpha=a*0.3;
+  rect(cx+0, oy+T*cs, T*cs, T*cs, '#1c2128','#2a2d33',1);
+  txt('(empty)', cx+T*cs/2, oy+T*cs+T*cs/2+4,{size:9,color:'#333'});
+  ctx.restore();
+
+  // C label
+  const ca=easeInOut(Math.max(0,(t-0.5)*2));
+  ctx.save(); ctx.globalAlpha=a*ca;
+  txt('C = A²', cx+N*cs/2, oy-14, {size:16,bold:true,color:'#3fb950'});
+  ctx.restore();
+
+  // summary stats
+  if(t>0.75){
+    const sa=easeInOut((t-0.75)*5);
+    ctx.save(); ctx.globalAlpha=a*sa;
+    const oy2=H-95;
+    const stats=[
+      {l:'nnz(C)', v:String(C_computed.flat().filter(x=>x).length), c:'#58a6ff'},
+      {l:'Tile work units', v:'3', c:'#3fb950'},
+      {l:'Global memory used', v:'0 bytes', c:'#f0883e'},
+      {l:'All on-chip?', v:'Yes ✓', c:'#3fb950'},
+    ];
+    stats.forEach(({l,v,c},i)=>{
+      const sx=W/2-270+i*140;
+      rect(sx,oy2,130,40,'#161b22',c+'66',1);
+      txt(l, sx+65, oy2+13,{size:9,color:'#6e7681'});
+      txt(v, sx+65, oy2+29,{size:12,bold:true,color:c});
+    });
+    ctx.restore();
+  }
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   STATE MACHINE
+═══════════════════════════════════════════════════════════════════ */
+let cur=0, animT=0, playing=false, raf=null, lastTS=0;
+let speed=1;
+
+function updateUI(){
+  const s=STEPS[cur];
+  document.getElementById('step-num').textContent=`Step ${s.tag} / ${STEPS.length.toString().padStart(2,'0')}`;
+  document.getElementById('step-title').textContent=s.title;
+  document.getElementById('step-body').innerHTML=s.body;
+  document.getElementById('sn').textContent=cur+1;
+  document.getElementById('extraBody').innerHTML=s.extra||'—';
+  document.getElementById('prog').style.width=`${100*(cur+animT)/STEPS.length}%`;
+
+  // pseudocode
+  const pseudo=document.getElementById('pseudo');
+  pseudo.innerHTML=PSEUDO_LINES.map((l,i)=>{
+    const isHi=s.hi&&s.hi.includes(i);
+    const isDone=s.hi&&Math.max(...s.hi)<i&&cur>0;
+    return `<div class="pl${isHi?' hi':''}">${l}</div>`;
+  }).join('');
+  if(s.hi&&s.hi.length){
+    const el=pseudo.querySelectorAll('.pl.hi')[0];
+    if(el) el.scrollIntoView({block:'nearest'});
+  }
+
+  // dots
+  const dotsEl=document.getElementById('dots');
+  dotsEl.innerHTML=STEPS.map((_,i)=>
+    `<div class="dot${i===cur?' cur':i<cur?' done':''}" onclick="jumpTo(${i})" title="Step ${i+1}"></div>`
+  ).join('');
+
+  document.getElementById('btnPrev').disabled=cur===0&&animT<0.05;
+  document.getElementById('btnNext').disabled=cur===STEPS.length-1&&animT>0.95;
+}
+
+function draw(){
+  ctx.clearRect(0,0,W,H);
+  // subtle background grid
+  ctx.save(); ctx.strokeStyle='#1c2128'; ctx.lineWidth=0.5;
+  for(let x=0;x<W;x+=40){ ctx.beginPath();ctx.moveTo(x,0);ctx.lineTo(x,H);ctx.stroke(); }
+  for(let y=0;y<H;y+=40){ ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(W,y);ctx.stroke(); }
+  ctx.restore();
+  STEPS[cur].draw(animT);
+}
+
+function loop(ts){
+  if(!lastTS) lastTS=ts;
+  const dt=(ts-lastTS)/1000*speed;
+  lastTS=ts;
+
+  const dur=STEPS[cur].dur||4000;
+  animT+=dt*1000/dur;
+  if(animT>=1){
+    animT=1;
+    if(cur<STEPS.length-1){
+      cur++; animT=0;
+    } else {
+      animT=1; playing=false;
+      document.getElementById('btnPlay').textContent='▶ Play';
+    }
+  }
+  updateUI(); draw();
+  if(playing) raf=requestAnimationFrame(loop);
+}
+
+function togglePlay(){
+  playing=!playing;
+  document.getElementById('btnPlay').textContent=playing?'⏸ Pause':'▶ Play';
+  if(playing){ lastTS=0; raf=requestAnimationFrame(loop); }
+  else { cancelAnimationFrame(raf); }
+}
+
+function navigate(dir){
+  cancelAnimationFrame(raf); playing=false;
+  document.getElementById('btnPlay').textContent='▶ Play';
+  if(dir>0&&cur<STEPS.length-1){ cur++; animT=0; }
+  else if(dir<0&&cur>0){ cur--; animT=0; }
+  else if(dir>0){ animT=1; }
+  else { animT=0; }
+  lastTS=0;
+  updateUI(); draw();
+}
+
+function jumpTo(i){
+  cancelAnimationFrame(raf); playing=false;
+  document.getElementById('btnPlay').textContent='▶ Play';
+  cur=i; animT=0; lastTS=0;
+  updateUI(); draw();
+}
+
+document.getElementById('spd').addEventListener('input',function(){
+  speed=parseFloat(this.value);
+  document.getElementById('spdVal').textContent=speed.toFixed(1)+'×';
+});
+
+// Keyboard shortcuts
+document.addEventListener('keydown',e=>{
+  if(e.key==='ArrowRight'||e.key==='.') navigate(1);
+  else if(e.key==='ArrowLeft'||e.key===',') navigate(-1);
+  else if(e.key===' '){e.preventDefault();togglePlay();}
+  else if(e.key>='1'&&e.key<='9') jumpTo(parseInt(e.key)-1);
+});
+
+/* ── Init ────────────────────────────────────────────────────── */
+resize();
+updateUI();
+draw();
+</script>
+</body>
+</html>
