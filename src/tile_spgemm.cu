@@ -524,6 +524,11 @@ void step3_numeric_kernel(
                 }
             }
         }
+        /* Barrier before the next iteration: prevents thread 0 from overwriting
+           s_posB_cur for ia+1 while other warps are still reading posB above.
+           s_posB_cur < 0 causes ALL threads to skip here via continue (same
+           condition for every thread), so there is no divergence on this barrier. */
+        __syncthreads();
     }
 
     /* Write output only if (r,c) is structurally present in C */
@@ -558,6 +563,12 @@ static void tiled_C_to_csr(
 
     /* Build O(1) tile-row lookup to avoid O(numTilesC × tilem) nested scans */
     int *tile_row = (int *)malloc(numTilesC * sizeof(int));
+    if (!tile_row) {
+        fprintf(stderr, "tiled_C_to_csr: out of memory for tile_row (%d ints)\n", numTilesC);
+        *h_rowPtrOut = NULL; *h_colIdxOut = NULL; *h_valOut = NULL; *nnzOut = 0;
+        free(rowCnt); free(prefix);
+        return;
+    }
     for (int tr = 0; tr < tilem; tr++)
         for (int w = h_tilePtrC[tr]; w < h_tilePtrC[tr+1]; w++)
             tile_row[w] = tr;
@@ -827,13 +838,15 @@ int main(int argc, char **argv)
                        numTilesC, TA.tilem, TA.tilen, A.rows, A.cols,
                        &h_rpC, &h_ciC, &h_vC, &nnzCSR);
         FILE *fp = fopen(save_path, "wb");
-        if (fp) {
+        if (fp && h_rpC) {
             fwrite(&A.rows, sizeof(int),    1,       fp);
             fwrite(&A.cols, sizeof(int),    1,       fp);
             fwrite(&nnzCSR, sizeof(int),    1,       fp);
             fwrite(h_rpC,   sizeof(int),    A.rows+1,fp);
             fwrite(h_ciC,   sizeof(int),    nnzCSR,  fp);
             fwrite(h_vC,    sizeof(double), nnzCSR,  fp);
+            fclose(fp);
+        } else if (fp) {
             fclose(fp);
         }
         free(h_tileNnzC_h); free(h_rowIdxC_h); free(h_colIdxC_h); free(h_valC_h);
