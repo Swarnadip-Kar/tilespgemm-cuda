@@ -309,6 +309,17 @@ static double step1_tile_structure(const TiledMatrix *A, const TiledMatrix *B,
     CUSPARSE_CHECK(cusparseSpGEMM_compute(handle, CUSPARSE_OPERATION_NON_TRANSPOSE, CUSPARSE_OPERATION_NON_TRANSPOSE, &alpha, mA, mB, &beta, mC, CUDA_R_64F, CUSPARSE_SPGEMM_DEFAULT, desc, &bs2, NULL));
     CUDA_CHECK(cudaMalloc(&b2, bs2?bs2:1));
 
+    // --- BUG FIX STARTS HERE ---
+    // Extract the TRUE number of nonzeros from the last element of the row pointer array
+    int nnzC_true = 0;
+    CUDA_CHECK(cudaMemcpy(&nnzC_true, d_rpC + rowsAp, sizeof(int), cudaMemcpyDeviceToHost));
+    int64_t nnzCp = nnzC_true;
+
+    // Destroy the old descriptor and recreate it with the correct nnzCp
+    cusparseDestroySpMat(mC);
+    CUSPARSE_CHECK(cusparseCreateCsr(&mC, rowsAp, colsBp, nnzCp, d_rpC, NULL, NULL, CUSPARSE_INDEX_32I, CUSPARSE_INDEX_32I, CUSPARSE_INDEX_BASE_ZERO, CUDA_R_64F));
+    // --- BUG FIX ENDS HERE ---
+
     // Output size is only available after workEstimation(b1) has run.
     int64_t rowsC, colsC, nnzCp;
     CUSPARSE_CHECK(cusparseSpMatGetSize(mC, &rowsC, &colsC, &nnzCp));
