@@ -32,9 +32,6 @@
 #define TILE_SIZE       256         /* TILE_DIM * TILE_DIM                   */
 #define WARP_SIZE       32
 #define WARPS_PER_BLOCK 8           /* Step-2 kernel warps per block         */
-/* Max matched intermediate tile-pairs per output C-tile.
-   Supports matrices with up to TILE_DIM * MAX_PAIRS = 4096 columns.        */
-#define MAX_PAIRS       256
 
 /* ═══════════════════════════════════════════════════════════════════════════
  *  TILED SPARSE FORMAT
@@ -473,41 +470,32 @@ void step3_numeric_kernel(
     int baseA  = A_tilePtr[tile_i];
     int baseB  = B_tilePtr[tile_j];
 
-    /* Thread 0 finds all matched pairs; stored in shared memory */
-    __shared__ int s_posA[MAX_PAIRS];
-    __shared__ int s_posB[MAX_PAIRS];
-    __shared__ int s_npairs;
+    /* Process matched (A_ik, B_kj) pairs one at a time to remove the fixed-size
+       MAX_PAIRS cap that would silently drop results for matrices wider than
+       TILE_DIM * MAX_PAIRS columns.  Thread 0 binary-searches B for each A
+       tile; all 256 threads then accumulate their (r,c) slot for that pair. */
+    __shared__ int s_posB_cur;   /* position in B's tile list, or -1 if no match */
 
-    if (slot == 0) {
-        int np = 0;
-        for (int ia = 0; ia < lenA; ia++) {
+    double sum = 0.0;
+
+    for (int ia = 0; ia < lenA; ia++) {
+        if (slot == 0) {
             int col_a = A_tileColIdx[baseA + ia];
-            int lo = 0, hi = lenB - 1;
+            int lo = 0, hi = lenB - 1, found_b = -1;
             while (lo <= hi) {
                 int mid = (lo + hi) >> 1;
                 int v   = B_tileColIdx[baseB + mid];
-                if (v == col_a) {
-                    if (np < MAX_PAIRS) {
-                        s_posA[np] = baseA + ia;
-                        s_posB[np] = baseB + mid;
-                        np++;
-                    }
-                    break;
-                } else if (v < col_a) lo = mid + 1;
-                else                   hi = mid - 1;
+                if (v == col_a) { found_b = mid; break; }
+                else if (v < col_a) lo = mid + 1;
+                else                hi = mid - 1;
             }
+            s_posB_cur = (found_b >= 0) ? baseB + found_b : -1;
         }
-        s_npairs = np;
-    }
-    __syncthreads();
+        __syncthreads();
+        if (s_posB_cur < 0) continue;
 
-    /* Each thread independently accumulates C[r][c] */
-    double sum = 0.0;
-    int    np  = s_npairs;
-
-    for (int p = 0; p < np; p++) {
-        int posA   = s_posA[p];
-        int posB   = s_posB[p];
+        int posA   = baseA + ia;
+        int posB   = s_posB_cur;
         int offA   = A_tileNnzPrefix[posA];
         int nnzA_t = A_tileNnzPrefix[posA+1] - offA;
         int offB   = B_tileNnzPrefix[posB];
