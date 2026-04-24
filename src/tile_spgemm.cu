@@ -595,7 +595,7 @@ int main(int argc, char **argv)
     // START END-TO-END ALGORITHM TIMER
     CUDA_CHECK(cudaDeviceSynchronize());
     double t_start_algo = wtime();
-    
+
     /* ── STEP 1 ── */
     fprintf(stderr, "[TileSpGEMM] Step 1: Computing tile structure of C ...\n");
     int *h_tilePtrC=NULL, *h_tileColIdxC=NULL, numTilesC=0;
@@ -695,17 +695,20 @@ int main(int argc, char **argv)
     double t_step3_ms = (double)f3;
     fprintf(stderr, "[TileSpGEMM] Step 3 done: nnzC=%d, %.2f ms\n", nnzC_total, t_step3_ms);
 
-    /* Stats */
-    double t_total_ms = t_step1_ms + t_step2_ms + t_step3_ms;
+   /* ── Stats & End-to-End Timing ── */
+    CUDA_CHECK(cudaDeviceSynchronize());
+    // 1. Calculate the TRUE end-to-end time FIRST
+    double t_total_ms = (wtime() - t_start_algo) * 1e3; 
 
     long long flops = 0;
-    for (int i=0; i<A.rows; i++)
-        for (int jp=A.rowPtr[i]; jp<A.rowPtr[i+1]; jp++)
+    for (int i=0; i<A.rows; i++) {
+        for (int jp=A.rowPtr[i]; jp<A.rowPtr[i+1]; jp++) {
             flops += 2LL * (A.rowPtr[A.colIdx[jp]+1] - A.rowPtr[A.colIdx[jp]]);
+        }
+    }
+    
+    // 2. Compute GFLOPS using the TRUE end-to-end time
     double gflops = (flops / 1e9) / (t_total_ms / 1e3);
-
-    CUDA_CHECK(cudaDeviceSynchronize());
-    double t_total_ms = (wtime() - t_start_algo) * 1e3; // Replace old total time calculation
 
     size_t peak_bytes = 2 * tiled_bytes + 
                         ((size_t)(TA.tilem+1)*sizeof(int) + (size_t)numTilesC*sizeof(int)*2 + 
