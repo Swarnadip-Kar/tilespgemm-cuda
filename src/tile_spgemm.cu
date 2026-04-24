@@ -421,12 +421,12 @@ void step2_symbolic_kernel(
             v |= __shfl_xor_sync(0xFFFFFFFFu, v, off);
         if (lane == 0) s_mask[wb][r] = v;
     }
-    __syncwarp();
+    __syncthreads();
 
     if (lane < TILE_DIM)
         C_mask[(size_t)wid * TILE_DIM + lane] =
             (unsigned short)(s_mask[wb][lane] & 0xFFFFu);
-    __syncwarp();
+    __syncthreads();
 
     if (lane == 0) {
         int total = 0; unsigned char acc = 0;
@@ -662,6 +662,8 @@ int main(int argc, char **argv)
             TB.d_tilePtr, TB.d_tileColIdx, TB.d_mask,
             d_tileColIdxC, d_tile_row,
             d_tileNnzC, d_rowPtrC, d_maskC, numTilesC);
+        CUDA_CHECK(cudaPeekAtLastError());
+        CUDA_CHECK(cudaDeviceSynchronize());
         CUDA_CHECK(cudaEventRecord(ev1));
         CUDA_CHECK(cudaEventSynchronize(ev1));
         CUDA_CHECK(cudaGetLastError());
@@ -713,6 +715,7 @@ int main(int argc, char **argv)
             TB.d_rowPtr,  TB.d_colIdx, TB.d_val, TB.d_mask,
             d_tileColIdxC, d_tileNnzPrefixC, d_rowPtrC, d_maskC, d_tile_row,
             d_rowIdxC, d_colIdxC, d_valC, numTilesC);
+        CUDA_CHECK(cudaPeekAtLastError());
             
         /* Sync to block CPU until the Step 3 kernel is entirely finished */
         CUDA_CHECK(cudaDeviceSynchronize());
