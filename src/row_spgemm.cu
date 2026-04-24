@@ -109,12 +109,20 @@ static double run_row_spgemm(CsrMatrix *A, CsrMatrix *B,
     CUDA_CHECK(cudaMalloc(&d_valC,    nnzC*sizeof(double)));
     CUSPARSE_CHECK(cusparseCsrSetPointers(matC, d_rowPtrC, d_colIdxC, d_valC));
 
-    /* ── Timed run ── */
+    /* ── Timed run: compute (arithmetic) + copy (output scatter) ── */
     cudaEvent_t t0, t1;
     CUDA_CHECK(cudaEventCreate(&t0));
     CUDA_CHECK(cudaEventCreate(&t1));
     CUDA_CHECK(cudaDeviceSynchronize());
     CUDA_CHECK(cudaEventRecord(t0));
+
+    CUSPARSE_CHECK(cusparseSpGEMM_compute(
+        handle,
+        CUSPARSE_OPERATION_NON_TRANSPOSE,
+        CUSPARSE_OPERATION_NON_TRANSPOSE,
+        &alpha, matA, matB, &beta, matC,
+        CUDA_R_64F, CUSPARSE_SPGEMM_DEFAULT,
+        spgemmDesc, &bufSize2, buf2));
 
     CUSPARSE_CHECK(cusparseSpGEMM_copy(
         handle,
