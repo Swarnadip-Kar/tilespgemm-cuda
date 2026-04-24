@@ -556,11 +556,14 @@ static void tiled_C_to_csr(
     for (int t = 0; t < numTilesC; t++) prefix[t+1] = prefix[t] + h_tileNnzC[t];
     int total = prefix[numTilesC];
 
+    /* Build O(1) tile-row lookup to avoid O(numTilesC × tilem) nested scans */
+    int *tile_row = (int *)malloc(numTilesC * sizeof(int));
+    for (int tr = 0; tr < tilem; tr++)
+        for (int w = h_tilePtrC[tr]; w < h_tilePtrC[tr+1]; w++)
+            tile_row[w] = tr;
+
     for (int wid = 0; wid < numTilesC; wid++) {
-        int tile_i = -1;
-        for (int tr = 0; tr < tilem; tr++)
-            if (h_tilePtrC[tr] <= wid && wid < h_tilePtrC[tr+1]) { tile_i = tr; break; }
-        if (tile_i < 0) continue;
+        int tile_i = tile_row[wid];
         int base = prefix[wid];
         for (int k = 0; k < h_tileNnzC[wid]; k++) {
             int gr = tile_i * TILE_DIM + (int)h_rowIdxC[base + k];
@@ -575,10 +578,7 @@ static void tiled_C_to_csr(
     *h_valOut    = (double *)malloc(total*sizeof(double));
     int *cursor  = (int *)calloc(rows, sizeof(int));
     for (int wid = 0; wid < numTilesC; wid++) {
-        int tile_i = -1;
-        for (int tr = 0; tr < tilem; tr++)
-            if (h_tilePtrC[tr] <= wid && wid < h_tilePtrC[tr+1]) { tile_i = tr; break; }
-        if (tile_i < 0) continue;
+        int tile_i = tile_row[wid];
         int tile_j = h_tileColIdxC[wid];
         int base   = prefix[wid];
         for (int k = 0; k < h_tileNnzC[wid]; k++) {
@@ -590,6 +590,7 @@ static void tiled_C_to_csr(
             (*h_valOut)[p]    = h_valC[base + k];
         }
     }
+    free(tile_row);
     free(rowCnt); free(prefix); free(cursor);
     (void)tilen;
 }
