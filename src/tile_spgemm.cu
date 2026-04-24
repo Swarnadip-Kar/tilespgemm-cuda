@@ -468,11 +468,16 @@ void step3_numeric_kernel(
     const unsigned char *C_rowPtr, const unsigned short *C_mask,
     const int *d_tile_row,
     unsigned char *C_rowIdx_out, unsigned char *C_colIdx_out, double *C_val_out,
-    int numTilesC)
+    int numTilesC,
+    int *d_step3_entered)                            /* diagnostic: entry counter */
 {
     int tile_idx = blockIdx.x;
     int slot     = threadIdx.x;
     if (tile_idx >= numTilesC) return;
+
+    /* Device-side diagnostic: thread (0,0) of first active block signals kernel entered */
+    if (blockIdx.x == 0 && threadIdx.x == 0)
+        atomicAdd(d_step3_entered, 1);
 
     int r = slot >> 4;
     int c = slot & 15;
@@ -699,31 +704,60 @@ int main(int argc, char **argv)
     CUDA_CHECK(cudaMalloc(&d_valC,    nnzC_safe * sizeof(double)));
 
    /* ── STEP 3 ── */
-    fprintf(stderr, "[TileSpGEMM] Step 3: GPU numeric (256 threads/tile) ...\n");
+    /* Allocate device-side diagnostic counter (confirms kernel entered) */
+    int *d_step3_entered = NULL;
+    CUDA_CHECK(cudaMalloc(&d_step3_entered, sizeof(int)));
+    CUDA_CHECK(cudaMemset(d_step3_entered, 0, sizeof(int)));
+
     double t_step3_ms = 0.0;
+    int    blocks     = (numTilesC > 0) ? numTilesC : 1;
     {
-        int blocks = (numTilesC > 0) ? numTilesC : 1;
-        
+        int threads = TILE_SIZE;
+
+        fprintf(stderr,
+                "[TileSpGEMM] Step 3 LAUNCH: blocks=%d  threads=%d  "
+                "numTilesC=%d  nnzC_total=%d\n",
+                blocks, threads, numTilesC, nnzC_total);
+
         /* Sync before wall-clock start to ensure GPU is completely idle */
         CUDA_CHECK(cudaDeviceSynchronize());
         double t_step3_wall_start = wtime();
 
-        step3_numeric_kernel<<<blocks, TILE_SIZE>>>(
+        step3_numeric_kernel<<<blocks, threads>>>(
             TA.d_tilePtr, TA.d_tileColIdx, TA.d_tileNnzPrefix,
             TA.d_rowPtr,  TA.d_colIdx, TA.d_val,
             TB.d_tilePtr, TB.d_tileColIdx, TB.d_tileNnzPrefix,
             TB.d_rowPtr,  TB.d_colIdx, TB.d_val, TB.d_mask,
             d_tileColIdxC, d_tileNnzPrefixC, d_rowPtrC, d_maskC, d_tile_row,
-            d_rowIdxC, d_colIdxC, d_valC, numTilesC);
+            d_rowIdxC, d_colIdxC, d_valC, numTilesC, d_step3_entered);
+
+        /* Immediate post-launch error check (catches bad launch configs) */
         CUDA_CHECK(cudaPeekAtLastError());
-            
-        /* Sync to block CPU until the Step 3 kernel is entirely finished */
+        fprintf(stderr, "[TileSpGEMM] Step 3 post-launch: kernel enqueued OK\n");
+
+        /* Wait for kernel completion and catch any runtime errors */
         CUDA_CHECK(cudaDeviceSynchronize());
-        CUDA_CHECK(cudaGetLastError());
-        
+
         t_step3_ms = (wtime() - t_step3_wall_start) * 1e3;
+        fprintf(stderr, "[TileSpGEMM] Step 3 post-sync:  completed in %.2f ms\n",
+                t_step3_ms);
     }
-    fprintf(stderr, "[TileSpGEMM] Step 3 done: nnzC=%d, %.2f ms\n", nnzC_total, t_step3_ms);
+
+    /* Copy back entry counter and report */
+    int h_step3_entered = 0;
+    CUDA_CHECK(cudaMemcpy(&h_step3_entered, d_step3_entered, sizeof(int),
+                          cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaFree(d_step3_entered));
+
+    fprintf(stderr,
+            "[TileSpGEMM] Step 3 STATS: entered=%d  numTilesC=%d  "
+            "blocks=%d  threads=%d  nnzC=%d  time=%.2f ms\n",
+            h_step3_entered, numTilesC,
+            blocks, TILE_SIZE,
+            nnzC_total, t_step3_ms);
+    if (h_step3_entered == 0 && numTilesC > 0)
+        fprintf(stderr, "[TileSpGEMM] WARNING: Step 3 kernel entered=0 "
+                        "— kernel may not have executed any work!\n");
 
    /* ── Stats & End-to-End Timing ── */
     CUDA_CHECK(cudaDeviceSynchronize());
