@@ -4,17 +4,17 @@
  * No cuSPARSE — fully custom CUDA implementation of SpGEMM (C = A²).
  *
  * Algorithm: Hash-Based Row SpGEMM with open-addressing global hash tables
- * Phase 1: upper_nnz_kernel  — per-row upper bound → size hash tables
- * Phase 2: spgemm_hash_kernel — 1 warp/row, atomicCAS+atomicAdd into hash
- * Phase 3: Thrust inclusive_scan — rowPtrC (prefix sum)
- * Phase 4: collect_kernel — hash tables → sorted CSR output
+ *   Phase 1: upper_nnz_kernel  — per-row upper bound → size hash tables
+ *   Phase 2: spgemm_hash_kernel — 1 warp/row, atomicCAS+atomicAdd into hash
+ *   Phase 3: Thrust inclusive_scan — rowPtrC (prefix sum)
+ *   Phase 4: collect_kernel — hash tables → sorted CSR output
  *
  * Hash table design:
- * - int   hash_keys[]  initialized to 0xFFFFFFFF = -1  (HASH_EMPTY)
- * - double hash_vals[] initialized to 0x00             (0.0)
- * - Open addressing with linear probing
- * - atomicCAS claims key slot; atomicAdd accumulates value (sm_89 supports
- * native double atomicAdd)
+ *   - int   hash_keys[]  initialized to 0xFFFFFFFF = -1  (HASH_EMPTY)
+ *   - double hash_vals[] initialized to 0x00             (0.0)
+ *   - Open addressing with linear probing
+ *   - atomicCAS claims key slot; atomicAdd accumulates value (sm_89 supports
+ *     native double atomicAdd)
  * ─────────────────────────────────────────────────────────────────────────────
  */
 
@@ -44,7 +44,7 @@ static inline double wtime(void) {
 #define WARPS_PER_BLK    8
 #define HASH_EMPTY       (-1)
 #define MIN_HASH_CAP     32
-// #define MAX_HASH_CAP     (1 << 17)   /* 128K entries/row max */ // BUG FIX: Removed MAX_HASH_CAP to allow larger hash tables when needed (with memory check)
+#define MAX_HASH_CAP     (1 << 17)   /* 128K entries/row max */
 
 typedef struct {
     int rows, cols, nnz;
@@ -87,8 +87,8 @@ static inline int next_pow2(int x) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * PHASE 1 — upper-bound nnz per row of C
- * upper_nnz[i] = Σ_{k: A[i,k]≠0} nnz(B row k)
+ *  PHASE 1 — upper-bound nnz per row of C
+ *  upper_nnz[i] = Σ_{k: A[i,k]≠0} nnz(B row k)
  * ═══════════════════════════════════════════════════════════════════════════ */
 __global__
 void upper_nnz_kernel(
@@ -104,13 +104,13 @@ void upper_nnz_kernel(
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * PHASE 2 — Hash-based SpGEMM  (1 warp per row of C)
+ *  PHASE 2 — Hash-based SpGEMM  (1 warp per row of C)
  *
- * Each lane takes every WARP_SIZE-th nonzero of A[i,*].
- * For each A[i,k] iterates over B[k,*]; inserts (j, A*B) into hash table.
- * atomicCAS(&key, HASH_EMPTY, j)  → claim slot
- * atomicAdd(&val, prod)           → accumulate (atomic double, sm≥6.0)
- * After fill: all lanes count occupied slots, warp-reduce → nnzC[i].
+ *  Each lane takes every WARP_SIZE-th nonzero of A[i,*].
+ *  For each A[i,k] iterates over B[k,*]; inserts (j, A*B) into hash table.
+ *    atomicCAS(&key, HASH_EMPTY, j)  → claim slot
+ *    atomicAdd(&val, prod)           → accumulate (atomic double, sm≥6.0)
+ *  After fill: all lanes count occupied slots, warp-reduce → nnzC[i].
  * ═══════════════════════════════════════════════════════════════════════════ */
 __global__
 void spgemm_hash_kernel(
@@ -158,7 +158,7 @@ void spgemm_hash_kernel(
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * PHASE 4 — Collect hash entries → CSR (one thread/row, insertion sort)
+ *  PHASE 4 — Collect hash entries → CSR (one thread/row, insertion sort)
  * ═══════════════════════════════════════════════════════════════════════════ */
 __global__
 void collect_kernel(
@@ -194,7 +194,7 @@ void collect_kernel(
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * MAIN
+ *  MAIN
  * ═══════════════════════════════════════════════════════════════════════════ */
 int main(int argc, char **argv)
 {
@@ -211,13 +211,6 @@ int main(int argc, char **argv)
     fprintf(stderr, "[RowSpGEMM] Matrix: %d x %d, nnz=%d\n", A.rows, A.cols, A.nnz);
     csr_upload(&A);
 
-    CUDA_CHECK(cudaDeviceSynchronize());
-    
-    // =========================================================================
-    // START END-TO-END ALGORITHM TIMER
-    // =========================================================================
-    double t_start_algo = wtime();
-
     /* ── Phase 1: upper-bound nnz per row ─────────────────────────────── */
     int *d_upper_nnz;
     CUDA_CHECK(cudaMalloc(&d_upper_nnz, (size_t)A.rows * sizeof(int)));
@@ -233,22 +226,19 @@ int main(int argc, char **argv)
                           (size_t)A.rows * sizeof(int), cudaMemcpyDeviceToHost));
     cudaFree(d_upper_nnz);
 
-    /* Compute hash_cap[i] and hash_off[i] for all rows */
-    int *h_hcap = (int*)malloc((size_t)A.rows * sizeof(int));
-    int *h_hoff = (int*)malloc((size_t)(A.rows + 1) * sizeof(int));
-    if (!h_hcap || !h_hoff) { fprintf(stderr, "[RowSpGEMM] OOM\n"); return 1; }
+    /* Compute hash_cap[i] for all rows.
+       Use size_t accumulation to detect overflow / large matrices.        */
+    int    *h_hcap = (int*)malloc((size_t)A.rows * sizeof(int));
+    if (!h_hcap) { fprintf(stderr, "[RowSpGEMM] OOM\n"); return 1; }
 
+    /* Running total in size_t — avoids int overflow (94k rows × 128K cap > INT_MAX) */
     size_t total_hash_entries = 0;
-    h_hoff[0] = 0;
     for (int i = 0; i < A.rows; i++) {
         int cap = next_pow2(h_upper[i] * 2);
         if (cap < MIN_HASH_CAP) cap = MIN_HASH_CAP;
-        
-        /* BUG FIX: Removed 'if (cap > MAX_HASH_CAP)' to prevent infinite probing loops */
-        
+        if (cap > MAX_HASH_CAP) cap = MAX_HASH_CAP;
         h_hcap[i] = cap;
         total_hash_entries += (size_t)cap;
-        h_hoff[i + 1] = h_hoff[i] + cap;
     }
     free(h_upper);
 
@@ -256,101 +246,195 @@ int main(int argc, char **argv)
     fprintf(stderr, "[RowSpGEMM] Hash tables: %zu entries, %.2f GB\n",
             total_hash_entries, hash_bytes_total / 1.0e9);
 
-    #define HASH_MEM_BUDGET ((size_t)4 * 1024 * 1024 * 1024)   /* 4 GB */
+    /* Memory budget for hash tables per batch (leave headroom for CSR arrays) */
+#define HASH_MEM_BUDGET ((size_t)4 * 1024 * 1024 * 1024)   /* 4 GB */
 
-    /* BUG FIX: Straight skip if memory exceeds budget (No Batching) */
-    if (hash_bytes_total > HASH_MEM_BUDGET) {
-        fprintf(stderr, "[RowSpGEMM] Memory (%.2f GB) exceeds 4GB Budget. Skipping.\n", hash_bytes_total / 1.0e9);
-        printf("{\"algo\":\"RowSpGEMM\",\"matrix\":\"%s\",\"skipped\":true}\n", mat_name);
-        
-        /* Cleanup and exit gracefully */
-        free(h_hcap); free(h_hoff);
-        cudaFree(A.d_rowPtr); cudaFree(A.d_colIdx); cudaFree(A.d_val);
-        free(A.rowPtr); free(A.colIdx); free(A.val);
-        return 0;
-    }
+    /* ─── Host output accumulators (filled batch by batch) ────────────── */
+    int    *h_nnzC    = (int*)calloc((size_t)A.rows, sizeof(int));
+    /* Growing host buffer for C nonzeros */
+    size_t  h_C_cap   = (size_t)A.nnz * 4 + 1024;   /* rough initial capacity */
+    int    *h_ciC_all = (int*)   malloc(h_C_cap * sizeof(int));
+    double *h_vC_all  = (double*)malloc(h_C_cap * sizeof(double));
+    size_t  h_C_used  = 0;
+    if (!h_nnzC || !h_ciC_all || !h_vC_all) {
+        fprintf(stderr, "[RowSpGEMM] OOM (host output buffers)\n"); return 1; }
 
-    /* ── Alloc + init global hash tables ──────────────────────────────── */
-    int *d_hcap, *d_hoff;
-    CUDA_CHECK(cudaMalloc(&d_hcap, (size_t)A.rows * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&d_hoff, (size_t)(A.rows + 1) * sizeof(int)));
-    CUDA_CHECK(cudaMemcpy(d_hcap, h_hcap, (size_t)A.rows * sizeof(int), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_hoff, h_hoff, (size_t)(A.rows + 1) * sizeof(int), cudaMemcpyHostToDevice));
+    /* CUDA events for timing the entire compute (hash + collect, all batches) */
+    cudaEvent_t ev0, ev1, ev2, ev3;
+    CUDA_CHECK(cudaEventCreate(&ev0)); CUDA_CHECK(cudaEventCreate(&ev1));
+    CUDA_CHECK(cudaEventCreate(&ev2)); CUDA_CHECK(cudaEventCreate(&ev3));
 
-    int *d_hkeys; double *d_hvals;
-    CUDA_CHECK(cudaMalloc(&d_hkeys, total_hash_entries * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&d_hvals, total_hash_entries * sizeof(double)));
-    CUDA_CHECK(cudaMemset(d_hkeys, 0xFF, total_hash_entries * sizeof(int)));
-    CUDA_CHECK(cudaMemset(d_hvals, 0x00, total_hash_entries * sizeof(double)));
+    double t_hash_total_ms = 0.0, t_collect_total_ms = 0.0;
 
-    int *d_nnzC;
-    CUDA_CHECK(cudaMalloc(&d_nnzC, (size_t)A.rows * sizeof(int)));
-    CUDA_CHECK(cudaMemset(d_nnzC, 0, (size_t)A.rows * sizeof(int)));
+    /* ════════════════════════════════════════════════════════════════════
+     *  Batched processing — process a range of rows at a time so that
+     *  hash table memory stays within HASH_MEM_BUDGET.
+     * ════════════════════════════════════════════════════════════════════ */
+    int i0 = 0;
+    while (i0 < A.rows) {
+        /* Find largest i1 such that sum(hcap[i0..i1)) × 12 ≤ budget */
+        size_t batch_hash_entries = 0;
+        int i1 = i0;
+        while (i1 < A.rows) {
+            size_t new_entries = batch_hash_entries + (size_t)h_hcap[i1];
+            if (new_entries * (sizeof(int) + sizeof(double)) > HASH_MEM_BUDGET
+                    && i1 > i0) break;
+            batch_hash_entries = new_entries;
+            i1++;
+        }
 
-    /* ── Phase 2: Hash kernel ─────────────────────────────────────────── */
-    {
-        int threads = WARPS_PER_BLK * WARP_SIZE;
-        int blocks  = (A.rows + WARPS_PER_BLK - 1) / WARPS_PER_BLK;
-        spgemm_hash_kernel<<<blocks, threads>>>(
-            A.d_rowPtr, A.d_colIdx, A.d_val,
-            A.d_rowPtr, A.d_colIdx, A.d_val,
-            d_hkeys, d_hvals, d_hoff, d_hcap,
-            d_nnzC, A.rows);
-        CUDA_CHECK(cudaGetLastError());
-    }
+        int batch_rows = i1 - i0;
+        fprintf(stderr, "[RowSpGEMM] Batch rows [%d,%d): %d rows, %.2f GB hash\n",
+                i0, i1, batch_rows,
+                batch_hash_entries * (sizeof(int) + sizeof(double)) / 1.0e9);
 
-    /* ── Phase 3: Build rowPtrC ───────────────────────────────────────── */
-    int *d_rowPtrC;
-    CUDA_CHECK(cudaMalloc(&d_rowPtrC, (size_t)(A.rows + 1) * sizeof(int)));
-    CUDA_CHECK(cudaMemset(d_rowPtrC, 0, sizeof(int))); /* Ensure first element is 0 */
-    thrust::inclusive_scan(
-        thrust::device_ptr<int>(d_nnzC),
-        thrust::device_ptr<int>(d_nnzC + A.rows),
-        thrust::device_ptr<int>(d_rowPtrC + 1));
-        
-    int nnzC = 0;
-    CUDA_CHECK(cudaMemcpy(&nnzC, d_rowPtrC + A.rows, sizeof(int), cudaMemcpyDeviceToHost));
+        /* Build batch-local int hoff[batch_rows+1] — fits in int since
+           batch_hash_entries ≤ HASH_MEM_BUDGET/(12) ≤ 4G/12 ≈ 357M < INT_MAX  */
+        int *h_hoff_b = (int*)malloc((size_t)(batch_rows + 1) * sizeof(int));
+        if (!h_hoff_b) { fprintf(stderr, "[RowSpGEMM] OOM hoff\n"); return 1; }
+        h_hoff_b[0] = 0;
+        for (int i = 0; i < batch_rows; i++)
+            h_hoff_b[i + 1] = h_hoff_b[i] + h_hcap[i0 + i];
 
-    /* ── Phase 4: Collect to CSR ──────────────────────────────────────── */
-    size_t safe_nnzC = (nnzC > 0) ? (size_t)nnzC : 1;
-    int    *d_ciC;
-    double *d_vC;
-    CUDA_CHECK(cudaMalloc(&d_ciC, safe_nnzC * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&d_vC,  safe_nnzC * sizeof(double)));
-    {
-        int blk = 256, grd = (A.rows + blk - 1) / blk;
-        collect_kernel<<<grd, blk>>>(
-            d_hkeys, d_hvals, d_hoff, d_hcap,
-            d_rowPtrC, d_ciC, d_vC, A.rows);
-        CUDA_CHECK(cudaGetLastError());
-    }
+        /* Upload batch hcap, hoff to device */
+        int *d_hcap_b, *d_hoff_b;
+        CUDA_CHECK(cudaMalloc(&d_hcap_b, (size_t)batch_rows * sizeof(int)));
+        CUDA_CHECK(cudaMalloc(&d_hoff_b, (size_t)(batch_rows + 1) * sizeof(int)));
+        CUDA_CHECK(cudaMemcpy(d_hcap_b, h_hcap + i0,
+                              (size_t)batch_rows * sizeof(int), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_hoff_b, h_hoff_b,
+                              (size_t)(batch_rows + 1) * sizeof(int), cudaMemcpyHostToDevice));
+        free(h_hoff_b);
 
-    CUDA_CHECK(cudaDeviceSynchronize()); // Ensure all GPU work is totally finished
-    
-    // =========================================================================
-    // END END-TO-END ALGORITHM TIMER
-    // =========================================================================
-    double time_ms = (wtime() - t_start_algo) * 1e3;
+        /* Alloc + init batch hash tables */
+        int    *d_hkeys_b;
+        double *d_hvals_b;
+        CUDA_CHECK(cudaMalloc(&d_hkeys_b, batch_hash_entries * sizeof(int)));
+        CUDA_CHECK(cudaMalloc(&d_hvals_b, batch_hash_entries * sizeof(double)));
+        CUDA_CHECK(cudaMemset(d_hkeys_b, 0xFF, batch_hash_entries * sizeof(int)));
+        CUDA_CHECK(cudaMemset(d_hvals_b, 0x00, batch_hash_entries * sizeof(double)));
+
+        /* Batch nnzC counter */
+        int *d_nnzC_b;
+        CUDA_CHECK(cudaMalloc(&d_nnzC_b, (size_t)batch_rows * sizeof(int)));
+        CUDA_CHECK(cudaMemset(d_nnzC_b, 0, (size_t)batch_rows * sizeof(int)));
+
+        /* ── Hash kernel (B = A, pass shifted rowPtr pointer) ── */
+        {
+            int threads = WARPS_PER_BLK * WARP_SIZE;
+            int blocks  = (batch_rows + WARPS_PER_BLK - 1) / WARPS_PER_BLK;
+            CUDA_CHECK(cudaDeviceSynchronize());
+            CUDA_CHECK(cudaEventRecord(ev0));
+            spgemm_hash_kernel<<<blocks, threads>>>(
+                A.d_rowPtr + i0, A.d_colIdx, A.d_val,  /* A rows [i0,i1) */
+                A.d_rowPtr,      A.d_colIdx, A.d_val,  /* B = A (full)   */
+                d_hkeys_b, d_hvals_b, d_hoff_b, d_hcap_b,
+                d_nnzC_b, batch_rows);
+            CUDA_CHECK(cudaEventRecord(ev1));
+            CUDA_CHECK(cudaEventSynchronize(ev1));
+            CUDA_CHECK(cudaGetLastError());
+        }
+        float ft_hash; CUDA_CHECK(cudaEventElapsedTime(&ft_hash, ev0, ev1));
+        t_hash_total_ms += (double)ft_hash;
+
+        /* Download nnzC for this batch */
+        int *h_nnzC_b = (int*)malloc((size_t)batch_rows * sizeof(int));
+        CUDA_CHECK(cudaMemcpy(h_nnzC_b, d_nnzC_b,
+                              (size_t)batch_rows * sizeof(int), cudaMemcpyDeviceToHost));
+        for (int i = 0; i < batch_rows; i++) h_nnzC[i0 + i] = h_nnzC_b[i];
+
+        /* Build batch-local rowPtrC (device + host) */
+        int *d_rowPtrC_b;
+        CUDA_CHECK(cudaMalloc(&d_rowPtrC_b, (size_t)(batch_rows + 1) * sizeof(int)));
+        CUDA_CHECK(cudaMemset(d_rowPtrC_b, 0, sizeof(int)));
+        thrust::inclusive_scan(
+            thrust::device_ptr<int>(d_nnzC_b),
+            thrust::device_ptr<int>(d_nnzC_b + batch_rows),
+            thrust::device_ptr<int>(d_rowPtrC_b + 1));
+        int batch_nnzC = 0;
+        CUDA_CHECK(cudaMemcpy(&batch_nnzC, d_rowPtrC_b + batch_rows,
+                              sizeof(int), cudaMemcpyDeviceToHost));
+
+        /* Grow host output buffer if needed */
+        if (h_C_used + (size_t)batch_nnzC > h_C_cap) {
+            h_C_cap = (h_C_used + (size_t)batch_nnzC) * 2 + 1024;
+            h_ciC_all = (int*)   realloc(h_ciC_all, h_C_cap * sizeof(int));
+            h_vC_all  = (double*)realloc(h_vC_all,  h_C_cap * sizeof(double));
+            if (!h_ciC_all || !h_vC_all) {
+                fprintf(stderr, "[RowSpGEMM] OOM growing output buffer\n"); return 1; }
+        }
+
+        /* Alloc batch device CSR output, run collect */
+        size_t bnnzC_safe = (batch_nnzC > 0) ? (size_t)batch_nnzC : 1;
+        int    *d_ciC_b;
+        double *d_vC_b;
+        CUDA_CHECK(cudaMalloc(&d_ciC_b, bnnzC_safe * sizeof(int)));
+        CUDA_CHECK(cudaMalloc(&d_vC_b,  bnnzC_safe * sizeof(double)));
+        {
+            int blk = 256, grd = (batch_rows + blk - 1) / blk;
+            CUDA_CHECK(cudaDeviceSynchronize());
+            CUDA_CHECK(cudaEventRecord(ev2));
+            collect_kernel<<<grd, blk>>>(
+                d_hkeys_b, d_hvals_b, d_hoff_b, d_hcap_b,
+                d_rowPtrC_b, d_ciC_b, d_vC_b, batch_rows);
+            CUDA_CHECK(cudaEventRecord(ev3));
+            CUDA_CHECK(cudaEventSynchronize(ev3));
+            CUDA_CHECK(cudaGetLastError());
+        }
+        float ft_collect; CUDA_CHECK(cudaEventElapsedTime(&ft_collect, ev2, ev3));
+        t_collect_total_ms += (double)ft_collect;
+
+        /* Download batch CSR to host buffer */
+        if (batch_nnzC > 0) {
+            CUDA_CHECK(cudaMemcpy(h_ciC_all + h_C_used, d_ciC_b,
+                                  (size_t)batch_nnzC * sizeof(int),    cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(h_vC_all  + h_C_used, d_vC_b,
+                                  (size_t)batch_nnzC * sizeof(double), cudaMemcpyDeviceToHost));
+        }
+        h_C_used += (size_t)batch_nnzC;
+
+        /* Free batch GPU memory */
+        cudaFree(d_hkeys_b); cudaFree(d_hvals_b);
+        cudaFree(d_hcap_b);  cudaFree(d_hoff_b);
+        cudaFree(d_nnzC_b);  cudaFree(d_rowPtrC_b);
+        cudaFree(d_ciC_b);   cudaFree(d_vC_b);
+        free(h_nnzC_b);
+
+        i0 = i1;
+    } /* end batch loop */
+
+    /* ── Build final rowPtrC and upload output to device ─────────────── */
+    int nnzC = (int)h_C_used;
+    int *h_rowPtrC = (int*)malloc((size_t)(A.rows + 1) * sizeof(int));
+    h_rowPtrC[0] = 0;
+    for (int i = 0; i < A.rows; i++)
+        h_rowPtrC[i + 1] = h_rowPtrC[i] + h_nnzC[i];
+
+    fprintf(stderr, "[RowSpGEMM] nnzC = %d\n", nnzC);
 
     /* ── Timing + stats ──────────────────────────────────────────────── */
+    double time_ms = t_hash_total_ms + t_collect_total_ms;
+
     long long flops = 0;
     for (int i = 0; i < A.rows; i++)
         for (int jp = A.rowPtr[i]; jp < A.rowPtr[i+1]; jp++)
             flops += 2LL * (A.rowPtr[A.colIdx[jp]+1] - A.rowPtr[A.colIdx[jp]]);
-    
     double gflops = (flops / 1e9) / (time_ms / 1e3);
 
     size_t mem_bytes =
         (size_t)(A.rows + 1) * sizeof(int) * 2 +
         (size_t)A.nnz * (sizeof(int) + sizeof(double)) * 2 +
-        hash_bytes_total + 
+        /* peak hash per batch — report worst-case single batch */
+        (total_hash_entries < HASH_MEM_BUDGET / (sizeof(int) + sizeof(double))
+             ? total_hash_entries
+             : HASH_MEM_BUDGET / (sizeof(int) + sizeof(double)))
+            * (sizeof(int) + sizeof(double)) +
         (size_t)nnzC * (sizeof(int) + sizeof(double)) +
         (size_t)(A.rows + 1) * sizeof(int);
 
-    fprintf(stderr, "[RowSpGEMM] nnzC = %d\n", nnzC);
     fprintf(stderr,
-            "[RowSpGEMM] total algorithm time = %.3f ms  %.4f GFlops\n",
-            time_ms, gflops);
+            "[RowSpGEMM] hash=%.3f ms  collect=%.3f ms  total=%.3f ms  %.4f GFlops\n",
+            t_hash_total_ms, t_collect_total_ms, time_ms, gflops);
 
     printf("{\"algo\":\"RowSpGEMM\",\"matrix\":\"%s\","
            "\"time_ms\":%.4f,\"gflops\":%.6f,"
@@ -359,10 +443,10 @@ int main(int argc, char **argv)
 
     /* ── Cleanup ─────────────────────────────────────────────────────── */
     cudaFree(A.d_rowPtr); cudaFree(A.d_colIdx); cudaFree(A.d_val);
-    cudaFree(d_hkeys); cudaFree(d_hvals); cudaFree(d_hcap); cudaFree(d_hoff);
-    cudaFree(d_nnzC); cudaFree(d_rowPtrC); cudaFree(d_ciC); cudaFree(d_vC);
     free(A.rowPtr); free(A.colIdx); free(A.val);
-    free(h_hcap); free(h_hoff);
-    
+    free(h_hcap);
+    free(h_nnzC); free(h_ciC_all); free(h_vC_all); free(h_rowPtrC);
+    cudaEventDestroy(ev0); cudaEventDestroy(ev1);
+    cudaEventDestroy(ev2); cudaEventDestroy(ev3);
     return 0;
 }
